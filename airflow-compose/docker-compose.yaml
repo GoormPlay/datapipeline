@@ -19,13 +19,13 @@ x-airflow-common:
     # The following line can be used to set a custom config file, stored in the local config folder
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     JAVA_HOME: /usr/lib/jvm/java-17-openjdk-arm64
+  env_file:
+    - .env
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - ./jobs:/opt/airflow/jobs
-    - ./utils:/opt/airflow/utils
     - /etc/localtime:/etc/localtime:ro # 도커 내부 date 명령: 한국 시간 기준
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -53,7 +53,7 @@ services:
       start_period: 5s
     restart: always
     ports:
-      - "5432:5432"
+      - "5555:5432"
     networks:
       - pipeline
 
@@ -78,8 +78,6 @@ services:
     command: webserver
     ports:
       - "8888:8080"
-    env_file:
-      - .env
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
       interval: 30s
@@ -103,8 +101,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
-    env_file:
-      - .env
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
@@ -147,8 +143,6 @@ services:
       # Required to handle warm shutdown of the celery workers properly
       # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
       DUMB_INIT_SETSID: "0"
-    env_file:
-      - .env
     restart: always
     depends_on:
       <<: *airflow-common-depends-on

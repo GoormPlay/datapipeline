@@ -1,12 +1,12 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, when
+from pyspark.sql.functions import from_json, col, when, from_utc_timestamp
 from pyspark.sql.types import StructType, StringType, TimestampType
 from pyspark.sql.functions import window
 import redis
-import requests
-from dotenv import load_dotenv
 import os
 from kafka import KafkaProducer
+from dotenv import load_dotenv
+import requests
 import json
 
 load_dotenv()
@@ -31,9 +31,11 @@ spark = SparkSession.builder \
 
 # Kafka에서 이벤트 읽기
 df = spark.readStream.format("kafka") \
-    .option("kafka.bootstrap.servers", "3.37.147.123:9092,3.36.188.73:9092,54.180.180.120:9092") \
+    .option("kafka.bootstrap.servers", "3.34.30.146:9092,3.36.10.141:9092,43.203.117.45:9092") \
     .option("subscribe", "ad-events") \
     .load()
+
+df.printSchema()
 
 # Kafka 메시지 파싱
 parsed_df = df.selectExpr("CAST(value AS STRING) as json") \
@@ -49,10 +51,13 @@ df_with_cost = parsed_df.withColumn("cost", when(col("event_type") == "click", 1
                                                .when(col("event_type") == "impression", 1)
                                                .otherwise(0))
 
+# df_with_kst = df_with_cost.withColumn(
+#     "timestamp", from_utc_timestamp(col("timestamp"), "Asia/Seoul")
+# )
 
 # Kafka 프로듀서 설정 (함수 밖에 생성)
 producer = KafkaProducer(
-    bootstrap_servers="3.37.147.123:9092,3.36.188.73:9092,54.180.180.120:9092",
+    bootstrap_servers="3.34.30.146:9092,3.36.10.141:9092,43.203.117.45:9092",
     value_serializer=lambda v: json.dumps(v).encode("utf-8")
 )
 
@@ -105,6 +110,8 @@ end
 """
 
 def process_batch(df, epoch_id):
+    print(f"🚀 [epoch {epoch_id}] 배치 처리 시작")
+
     r = redis.Redis(host="localhost", port=6379, db=0)
     lua_script = r.register_script(LUA_SCRIPT)
 
