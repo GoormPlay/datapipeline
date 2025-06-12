@@ -19,14 +19,13 @@ x-airflow-common:
     # The following line can be used to set a custom config file, stored in the local config folder
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     JAVA_HOME: /usr/lib/jvm/java-17-openjdk-arm64
-  env_file:
-    - .env
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - /etc/localtime:/etc/localtime:ro # 도커 내부 date 명령: 한국 시간 기준
+    - /Users/jeongmieun/app/spark/jars:/opt/spark/jars
+    - ./dags/spark:/opt/spark/data/
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -309,4 +308,4 @@ volumes:
 
 networks:
   pipeline:
-    driver: bridge
+    external: true
