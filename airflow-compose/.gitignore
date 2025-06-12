@@ -54,3 +54,4 @@ dags/*.log
 .idea/
 *.iml
 
+*.ipynb
