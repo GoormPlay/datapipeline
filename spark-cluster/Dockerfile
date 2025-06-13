@@ -9,10 +9,9 @@ RUN set -ex; \
     rm -rf /var/lib/apt/lists/*
 
 # 필요한 JAR 다운로드
+# spark-submit 시 --packages 옵션을 통해 필요한 의존성을 가져오므로 Dockerfile에서 직접 다운로드할 필요가 줄어듭니다.
+# 만약 특정 JAR가 모든 작업에 공통적으로 필요하고, --packages로 관리하고 싶지 않다면 여기에 유지할 수 있습니다.
+# 현재 설정(config.yaml)에서는 S3 관련 JAR를 --packages로 지정하고 있습니다.
 ENV SPARK_HOME=/opt/spark
-
-RUN wget -P ${SPARK_HOME}/jars/ https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.1/hadoop-aws-3.3.1.jar && \
-    wget -P ${SPARK_HOME}/jars/ https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.11.901/aws-java-sdk-bundle-1.11.901.jar && \
-    wget -P ${SPARK_HOME}/jars/ https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar
 
 USER spark

@@ -37,13 +37,9 @@ AVRO_SCHEMA_STRING = """
         {"name": "videoId", "type": ["null", "string"], "default": null},
         {"name": "title", "type": ["null", "string"], "default": null},
         {"name": "userId", "type": "string"},
-        {"name": "timestamp", "type": "string"},
-        {"name": "eventType", "type": "string"},
-        {"name": "page", "type": "string"},
         {"name": "liked", "type": ["null", "boolean"], "default": null},
         {"name": "review", "type": ["null", "string"], "default": null},
-        {"name": "rating", "type": ["null", "int"], "default": null},
-        {"name": "contentCategory", "type": ["null", {"type": "array", "items": "string"}], "default": null}
+        {"name": "rating", "type": ["null", "int"], "default": null}
     ]
 }
 """
