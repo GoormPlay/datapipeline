@@ -23,24 +23,27 @@ except ImportError:
 
 from utils.slack_fail_noti import task_fail_slack_alert
 
-kafka_cluster = '43.201.43.88:9092,15.165.234.219:9092,3.35.228.177:9092'
-SCHEMA_REGISTRY_URL = 'http://43.201.43.88:8081' # Schema Registry URL
+kafka_cluster = '43.202.109.64:9092,3.38.172.147:9092,43.203.178.64:9092'
+SCHEMA_REGISTRY_URL = 'http://43.202.109.64:8081' # Schema Registry URL
 KAFKA_TOPIC_AVRO = 'userlog-avro-topic'         # Avro 메시지를 위한 Kafka 토픽
 
 # Avro 스키마 정의 (make_event 함수 구조 기반)
 AVRO_SCHEMA_STRING = """
 {
-    "type": "record",
-    "name": "UserEvent",
-    "namespace": "com.example.airflow.dummy",
-    "fields": [
-        {"name": "videoId", "type": ["null", "string"], "default": null},
-        {"name": "title", "type": ["null", "string"], "default": null},
-        {"name": "userId", "type": "string"},
-        {"name": "liked", "type": ["null", "boolean"], "default": null},
-        {"name": "review", "type": ["null", "string"], "default": null},
-        {"name": "rating", "type": ["null", "int"], "default": null}
-    ]
+  "type": "record",
+  "name": "UserEvent",
+  "fields": [
+    {"name": "videoId", "type": ["null", "string"]},
+    {"name": "title", "type": ["null", "string"]},
+    {"name": "userId", "type": ["null","string"]},
+    {"name": "timestamp", "type": ["null", "long"]},
+    {"name": "eventType", "type": ["null", "string"]},
+    {"name": "page", "type": ["null", "string"]},
+    {"name": "liked", "type": ["null", "boolean"]},
+    {"name": "review", "type": ["null", "string"]},
+    {"name": "rating", "type": ["null", "int"]},
+    {"name": "contentCategory", "type": ["null", {"type": "array", "items": "string"}], "default": null}
+  ]
 }
 """
 
@@ -92,28 +95,41 @@ def generate_event_avro(**kwargs):
         except Exception as e:
             print(f"❌ Error fetching data from MongoDB: {e}. Will proceed without MongoDB data.")
 
-    num_events = 1_000_000  # 필요한 양으로 조절 가능
+    num_events = 1_00_000  # 필요한 양으로 조절 가능
     # num_events = 1000 # 테스트용
 
     event_types = ["like_click", "content_click", "review_write", "rating_submit"]
     pages = ["content_detail", "main"]
 
     def make_event_payload(): # 함수명 변경하여 명확화
-        event = {}
+        # Avro 스키마에 정의된 모든 필드를 초기에 None으로 설정 (userId, timestamp 등은 아래에서 덮어쓰여짐)
+        event = {
+            "videoId": None,
+            "title": None,
+            "userId": None, # Placeholder, will be overwritten
+            "timestamp": None, # Placeholder, will be overwritten
+            "eventType": None, # Placeholder, will be overwritten
+            "page": None, # Placeholder, will be overwritten
+            "liked": None,
+            "review": None,
+            "rating": None,
+            "contentCategory": None
+        }
         if mongo_contents_data:
             selected_content = random.choice(mongo_contents_data)
             event["videoId"] = selected_content.get("videoId")
             event["title"] = selected_content.get("title")
-        else:
-            event["videoId"] = None
-            event["title"] = None # Avro 스키마에 따라 null 허용
-
-        event.update({
-            "userId": fake.uuid4(),
-            "timestamp": fake.date_time_between(start_date="-1d", end_date="now").isoformat() + "Z",
-            "eventType": random.choice(event_types),
-            "page": random.choice(pages),
-        })
+        # videoId와 title은 mongo_contents_data가 없으면 이미 None으로 설정됨
+       # ISO 문자열 대신 Unix 타임스탬프(밀리초)로 설정
+            fake_datetime = fake.date_time_between(start_date="-1d", end_date="now")
+            unix_timestamp = int(fake_datetime.timestamp() * 1000)  # 초를 밀리초로 변환
+    
+            event.update({ # 필수 필드 및 기본값 없는 필드 업데이트
+                "userId": fake.uuid4(),
+                "timestamp": unix_timestamp,  # 문자열에서 정수로 변경
+                "eventType": random.choice(event_types),
+                "page": random.choice(pages),
+            })
 
         if event["eventType"] == "like_click":
             event["liked"] = random.choice([True, False])
@@ -123,8 +139,7 @@ def generate_event_avro(**kwargs):
             event["rating"] = random.randint(1, 5)
         elif event["eventType"] == "content_click": # 'else' 대신 명시적으로 'content_click' 처리
             event["contentCategory"] = [fake.word() for _ in range(random.randint(1, 3))]
-        else: # 혹시 모를 다른 eventType (현재는 없지만)
-            pass
+        # 다른 eventType의 경우, 해당 특정 필드들은 None으로 유지됨
         return event
 
     print(f"🚀 Producing {num_events:,} dummy Avro messages to Kafka topic `{KAFKA_TOPIC_AVRO}`")

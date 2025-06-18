@@ -47,6 +47,12 @@ def build_spark_submit_command(config, job_script):
     # 패키지 추가
     if config['spark'].get('packages'):
         cmd.extend(["--packages", ",".join(config['spark']['packages'])])
+
+    # S3 관련 Hadoop 설정 추가 (config.yaml에 정의된 경우)
+    if config.get('s3'):
+        if 'connection_ssl_enabled' in config['s3']:
+            cmd.extend([f"--conf", f"spark.hadoop.fs.s3a.connection.ssl.enabled={str(config['s3']['connection_ssl_enabled']).lower()}"])
+        # endpoint, access_key, secret_key는 이미 인자로 전달되므로 schema_slack_iceberg.py에서 설정
     
     # 스크립트 경로 추가
     cmd.append(job_script)
@@ -78,7 +84,7 @@ def build_spark_submit_command(config, job_script):
     # 슬랙 웹훅 URL 인자 추가 (선택적)
     if config.get('slack') and config['slack'].get('webhook_url'):
         cmd.extend(["--slack_webhook_url", config['slack']['webhook_url']])
-    
+
     return cmd
 
 def main():

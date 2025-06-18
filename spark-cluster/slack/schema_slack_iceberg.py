@@ -1,13 +1,52 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, to_date
+from pyspark.sql.functions import col, to_timestamp, lit, current_timestamp, count # lit 추가
 from pyspark.sql.avro.functions import from_avro
-import requests
+from pyspark.sql.types import *
 import argparse
-import json # 스키마 정보 처리를 위해 추가
-import boto3 # S3 연동을 위해 추가
-from botocore.exceptions import ClientError # Boto3 예외 처리를 위해 추가
+import requests
+import hashlib
+import json
+import boto3
+from botocore.exceptions import ClientError
 
-# Avro 스키마를 Schema Registry에서 가져오기
+### 스키마 유틸 ###
+
+def avro_type_to_spark_type(avro_type):
+    if isinstance(avro_type, str):
+        return {
+            "string": StringType(),
+            "int": IntegerType(),
+            "long": LongType(),
+            "boolean": BooleanType(),
+            "float": FloatType(),
+            "double": DoubleType(),
+            "bytes": BinaryType()
+        }.get(avro_type, StringType())
+    if isinstance(avro_type, list):
+        non_null = [t for t in avro_type if t != "null"]
+        return avro_type_to_spark_type(non_null[0]) if non_null else StringType()
+    if isinstance(avro_type, dict):
+        type_ = avro_type["type"]
+        if type_ == "record":
+            return StructType([
+                StructField(f["name"], avro_type_to_spark_type(f["type"]))
+                for f in avro_type["fields"]
+            ])
+        elif type_ == "array":
+            return ArrayType(avro_type_to_spark_type(avro_type["items"]))
+        elif type_ == "map":
+            return MapType(StringType(), avro_type_to_spark_type(avro_type["values"]))
+    return StringType()
+
+def avro_json_to_spark_schema(avro_schema_str: str) -> StructType:
+    avro_json = json.loads(avro_schema_str)
+    return StructType([
+        StructField(f["name"], avro_type_to_spark_type(f["type"]), True)
+        for f in avro_json["fields"]
+    ])
+
+### 스키마 관리 ###
+
 def fetch_avro_schema(schema_registry_url, subject):
     url = f"{schema_registry_url}/subjects/{subject}/versions/latest"
     response = requests.get(url)
@@ -15,100 +54,109 @@ def fetch_avro_schema(schema_registry_url, subject):
     schema_data = response.json()
     return schema_data['schema'], schema_data['version']
 
-def get_last_known_version_from_s3(s3_client, bucket, key):
-    """S3에서 마지막으로 저장된 스키마 버전을 가져옵니다."""
+def get_schema_hash(schema_str):
+    schema_dict = json.loads(schema_str)
+    normalized = json.dumps(schema_dict, sort_keys=True)
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+
+def get_last_schema_hash_from_s3(s3_client, bucket, key):
     try:
-        response = s3_client.get_object(Bucket=bucket, Key=key)
-        return int(response['Body'].read().decode('utf-8'))
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        return obj['Body'].read().decode('utf-8')
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
-            print(f"S3에 이전 스키마 버전 파일 없음: s3://{bucket}/{key}")
-            return None # 최초 실행 시 버전 정보 없음
+            return None
         else:
-            print(f"S3에서 스키마 버전 로드 중 오류 발생: {e}")
             raise
 
-def save_current_version_to_s3(s3_client, bucket, key, version):
-    """현재 스키마 버전을 S3에 저장합니다."""
-    try:
-        s3_client.put_object(Bucket=bucket, Key=key, Body=str(version).encode('utf-8'))
-        print(f"스키마 버전 ({version})을 S3에 저장 완료: s3://{bucket}/{key}")
-    except ClientError as e:
-        print(f"S3에 스키마 버전 저장 중 오류 발생: {e}")
-        raise
+def save_schema_hash_to_s3(s3_client, bucket, key, schema_hash):
+    s3_client.put_object(Bucket=bucket, Key=key, Body=schema_hash.encode('utf-8'))
+
+def save_schema_to_s3(s3_client, bucket, key, schema_str):
+    s3_client.put_object(Bucket=bucket, Key=key, Body=schema_str.encode('utf-8'))
 
 def send_slack_notification(webhook_url, message):
-    """Slack 웹훅을 사용하여 메시지를 전송합니다. (실제 구현 필요)"""
     if webhook_url:
-        response = requests.post(webhook_url, json={'text': message})
-        print(f"Slack 알림 전송 시도: {response.status_code} - {response.text}")
+        try:
+            response = requests.post(webhook_url, json={'text': message}, timeout=10) # 타임아웃 추가
+            if response.status_code == 200:
+                print(f"✅ Slack 알림 전송 성공 (상태 코드: {response.status_code})")
+            else:
+                # 개인 정보 보호를 위해 URL의 일부만 로깅
+                safe_url = webhook_url[:webhook_url.find('hooks.slack.com/')+len('hooks.slack.com/')] + '...' if 'hooks.slack.com/' in webhook_url else "URL 형식 오류"
+                print(f"❌ Slack 알림 전송 실패 (상태 코드: {response.status_code})")
+                print(f"    Webhook URL (일부): {safe_url}")
+                print(f"    응답 내용: {response.text}") # Slack의 응답 내용 출력
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Slack 알림 전송 중 예외 발생: {e}")
     else:
-        print("Slack Webhook URL이 없어 알림을 보내지 않습니다.")
+        print("⚠️ Slack Webhook URL이 없어 알림 생략됨")
+
+### MAIN ###
 
 def main():
-    parser = argparse.ArgumentParser(description="Kafka to Iceberg Streaming Job")
-    parser.add_argument("--schema_registry_url", required=True, help="Schema Registry URL (e.g., http://localhost:8081)")
-    parser.add_argument("--schema_subject", required=True, help="Avro schema subject name in Schema Registry (e.g., userlog-avro-topic-value)")
-    parser.add_argument("--kafka_brokers", required=True, help="Kafka bootstrap servers (comma-separated, e.g., host1:9092,host2:9092)")
-    parser.add_argument("--kafka_topic", required=True, help="Kafka topic to subscribe to (e.g., userlog-avro-topic)")
-    parser.add_argument("--iceberg_catalog_name", required=True, help="Iceberg catalog name (e.g., userlogs_catalog)")
-    parser.add_argument("--iceberg_warehouse_path", required=True, help="Iceberg catalog warehouse S3 path (e.g., s3a://userlog-data/warehouse)")
-    parser.add_argument("--iceberg_db_name", required=True, help="Iceberg database name (e.g., analytics)")
-    parser.add_argument("--iceberg_table_name", required=True, help="Iceberg table name (e.g., user_logs)")
-    parser.add_argument("--checkpoint_location", required=True, help="S3 path for Spark checkpointing (e.g., s3a://userlog-data/checkpoints/user_logs_checkpoint)")
-    parser.add_argument("--s3_endpoint", required=True, help="S3 endpoint URL (e.g., http://minio:9000)")
-    parser.add_argument("--s3_access_key", required=True, help="S3 access key")
-    parser.add_argument("--s3_secret_key", required=True, help="S3 secret key")
-    parser.add_argument("--processing_time_trigger", default="30 minutes", help="Spark streaming trigger processing time (e.g., '30 minutes', '1 hour')")
-    # 스키마 버전 상태 저장 및 알림을 위한 인자 추가
-    parser.add_argument("--schema_version_s3_bucket", required=True, help="스키마 버전 상태 저장을 위한 S3 버킷")
-    parser.add_argument("--schema_version_s3_key", required=True, help="스키마 버전 상태 저장을 위한 S3 객체 키 (예: schema_versions/my_subject.version)")
-    parser.add_argument("--slack_webhook_url", default=None, help="스키마 버전 변경 알림을 위한 Slack Webhook URL")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--schema_registry_url", required=True)
+    parser.add_argument("--schema_subject", required=True)
+    parser.add_argument("--kafka_brokers", required=True)
+    parser.add_argument("--kafka_topic", required=True)
+    parser.add_argument("--iceberg_catalog_name", required=True)
+    parser.add_argument("--iceberg_warehouse_path", required=True)
+    parser.add_argument("--iceberg_db_name", required=True)
+    parser.add_argument("--iceberg_table_name", required=True)
+    parser.add_argument("--checkpoint_location", required=True)
+    parser.add_argument("--s3_endpoint", required=True)
+    parser.add_argument("--s3_access_key", required=True)
+    parser.add_argument("--s3_secret_key", required=True)
+    parser.add_argument("--processing_time_trigger", default="30 minutes")
+    parser.add_argument("--schema_version_s3_bucket", required=True)
+    parser.add_argument("--schema_version_s3_key", required=True)
+    parser.add_argument("--slack_webhook_url", default=None)
 
     args = parser.parse_args()
 
-    # S3 클라이언트 초기화 (스키마 버전 관리용)
-    # Spark의 S3 설정과 별개로, 이 스크립트에서 직접 S3에 접근하기 위함.
-    s3_client_for_schema_version = boto3.client(
+    # S3 client
+    s3_client = boto3.client(
         's3',
-        endpoint_url=args.s3_endpoint, # Spark 작업용 S3 엔드포인트와 동일하게 사용
+        endpoint_url=args.s3_endpoint,
         aws_access_key_id=args.s3_access_key,
         aws_secret_access_key=args.s3_secret_key
     )
 
-    # Schema Registry에서 현재 스키마와 버전 가져오기
-    current_avro_schema_str, current_schema_version = fetch_avro_schema(args.schema_registry_url, args.schema_subject)
-    
-    # S3에서 마지막으로 알려진 스키마 버전 가져오기
-    last_known_schema_version = get_last_known_version_from_s3(
-        s3_client_for_schema_version, args.schema_version_s3_bucket, args.schema_version_s3_key
+    # Fetch current schema
+    current_schema_str, current_version = fetch_avro_schema(
+        args.schema_registry_url, args.schema_subject
+    )
+    print("DEBUG: Fetched Avro schema string from Schema Registry:") # 디버그 로그 추가
+    print(current_schema_str)
+
+    current_schema_hash = get_schema_hash(current_schema_str)
+    spark_schema = avro_json_to_spark_schema(current_schema_str)
+
+    # Check for schema change
+    # (스키마 변경 감지 및 알림 로직은 동일하게 유지)
+    hash_s3_key = args.schema_version_s3_key.replace(".version", ".hash")
+    last_schema_hash = get_last_schema_hash_from_s3(
+        s3_client, args.schema_version_s3_bucket, hash_s3_key
     )
 
-    if last_known_schema_version is None: # 최초 실행 또는 S3에 버전 정보가 없는 경우
-        notification_message = (
-            f"ℹ️ 최초 스키마 버전 등록 알림\n"
-            f"Subject: `{args.schema_subject}` (Version: {current_schema_version}) @ `{args.schema_registry_url}/{args.schema_subject}/versions/latest`\n"
-            f"현재 버전({current_schema_version})을 S3(`s3://{args.schema_version_s3_bucket}/{args.schema_version_s3_key}`)에 저장합니다."
-        )
-        send_slack_notification(args.slack_webhook_url, notification_message)
-        save_current_version_to_s3(s3_client_for_schema_version, args.schema_version_s3_bucket, args.schema_version_s3_key, current_schema_version)
-    elif current_schema_version > last_known_schema_version:
-        notification_message = (
-            f"🚨 새로운 스키마 버전 감지!\n"
-            f"Subject: `{args.schema_subject}` @ `{args.schema_registry_url}`\n"
-            f"이전 버전: {last_known_schema_version}, 새 버전: {current_schema_version}\n"
-            f"새로운 버전({current_schema_version})으로 S3 상태를 업데이트합니다."
-        )
-        send_slack_notification(args.slack_webhook_url, notification_message)
-        save_current_version_to_s3(s3_client_for_schema_version, args.schema_version_s3_bucket, args.schema_version_s3_key, current_schema_version)
+    if last_schema_hash != current_schema_hash:
+        msg = f"""
+✨ *Avro 스키마 변경 감지!*
+*Subject:* `{args.schema_subject}`
+*이전 해시:* `{last_schema_hash or '없음'}`
+*신규 해시:* `{current_schema_hash}`
+"""
+        send_slack_notification(args.slack_webhook_url, msg)
+        save_schema_hash_to_s3(s3_client, args.schema_version_s3_bucket, hash_s3_key, current_schema_hash)
+        schema_key = args.schema_version_s3_key.replace(".version", f"_v{current_version}.avsc")
+        save_schema_to_s3(s3_client, args.schema_version_s3_bucket, schema_key, current_schema_str)
     else:
-        print(f"✅ 스키마 버전({current_schema_version}) 변경 없음. S3 스키마 버전 상태는 최신입니다. (마지막 확인 버전: {last_known_schema_version})")
+        print("✅ Avro 스키마 변경 없음")
 
-    full_iceberg_table_name = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.{args.iceberg_table_name}"
-
-    # Spark 세션 구성
-    spark_builder = SparkSession.builder \
-        .appName(f"KafkaToIceberg_{args.iceberg_db_name}_{args.iceberg_table_name}") \
+    # SparkSession
+    spark = SparkSession.builder \
+        .appName("KafkaToIceberg") \
         .config(f"spark.sql.catalog.{args.iceberg_catalog_name}", "org.apache.iceberg.spark.SparkCatalog") \
         .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.type", "hadoop") \
         .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.warehouse", args.iceberg_warehouse_path) \
@@ -116,13 +164,14 @@ def main():
         .config("spark.hadoop.fs.s3a.access.key", args.s3_access_key) \
         .config("spark.hadoop.fs.s3a.secret.key", args.s3_secret_key) \
         .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider") \
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+        .getOrCreate()
 
-    spark = spark_builder.getOrCreate()
+    # 원본 데이터 저장 테이블
+    raw_data_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.{args.iceberg_table_name}"
+    # 집계 데이터 저장 테이블 (예시: 비디오별 클릭 수)
+    video_clicks_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.video_clicks_summary"
 
-    # Kafka 스트림 읽기
+    # Kafka ingestion
     df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", args.kafka_brokers) \
@@ -130,19 +179,104 @@ def main():
         .option("startingOffsets", "latest") \
         .load()
 
-    # Avro 역직렬화 및 데이터 가공 (항상 Schema Registry의 최신 스키마 사용)
-    parsed_df = df.select(from_avro(col("value"), current_avro_schema_str).alias("data")).select("data.*")
-    final_df = parsed_df.withColumn("datestamp", to_date(col("timestamp")))
+    # 원본 데이터 파싱 및 전처리
+    # 1. Avro 디코딩 (PERMISSIVE 모드로 변경하여 일부 레코드 오류에 강인하게)
+    decoded_df = df.select(
+        from_avro(col("value"), current_schema_str, {"mode": "PERMISSIVE"}).alias("data")
+    )
 
-    # Iceberg 테이블에 저장
-    query = final_df.writeStream \
+    # 2. 파싱 실패 레코드 필터링 (data 컬럼이 null인 경우)
+    #    이러한 레코드는 별도로 로깅하거나 Dead Letter Queue(DLQ)로 보낼 수 있습니다.
+    parsed_df = decoded_df.filter(col("data").isNotNull()).select("data.*")
+    print("DEBUG: Schema of parsed_df AFTER from_avro and select(\"data.*\"):") # 디버그 로그 추가
+    parsed_df.printSchema() 
+
+    # 3. event_time 컬럼 추가 (타임스탬프 변환)
+    #    'timestamp' 필드의 실제 데이터 타입에 따라 변환 방식이 달라질 수 있습니다.
+    #    Avro 스키마에서 'timestamp'가 long (밀리초) 또는 string (ISO 형식 등)일 수 있습니다.
+    expected_event_time_col = "event_time" # 사용할 컬럼명 변수화
+
+    if "timestamp" in parsed_df.columns:
+        timestamp_dtype = parsed_df.schema["timestamp"].dataType
+        print(f"INFO: 'timestamp' 컬럼 발견. 타입: {timestamp_dtype}")
+        if isinstance(timestamp_dtype, LongType):
+            # Avro 'long' 타입 (밀리초 단위 Unix timestamp로 가정)
+            parsed_df = parsed_df.withColumn(expected_event_time_col, (col("timestamp") / 1000).cast(TimestampType()))
+            print(f"INFO: 'timestamp' (LongType) 필드를 밀리초 epoch로 간주하여 '{expected_event_time_col}' (TimestampType)으로 변환했습니다.")
+        elif isinstance(timestamp_dtype, StringType):
+            # Avro 'string' 타입
+            parsed_df = parsed_df.withColumn(expected_event_time_col, to_timestamp(col("timestamp")))
+            print(f"INFO: 'timestamp' (StringType) 필드를 '{expected_event_time_col}' (TimestampType)으로 변환했습니다 (to_timestamp 사용).")
+        elif isinstance(timestamp_dtype, (IntegerType, DoubleType, FloatType)): # 숫자형 (초 단위 Unix timestamp로 가정)
+            parsed_df = parsed_df.withColumn(expected_event_time_col, col("timestamp").cast(TimestampType()))
+            print(f"INFO: 'timestamp' ({str(timestamp_dtype)}) 필드를 초단위 epoch로 간주하여 '{expected_event_time_col}' (TimestampType)으로 변환했습니다.")
+        else:
+            # 지원하지 않는 타입이거나, 이미 TimestampType일 수도 있습니다.
+            print(f"경고: 'timestamp' 컬럼의 타입({str(timestamp_dtype)})이 예상과 다릅니다. '{expected_event_time_col}'을 null로 채웁니다.")
+            parsed_df = parsed_df.withColumn(expected_event_time_col, lit(None).cast(TimestampType()))
+    else:
+        print(f"경고: Avro 데이터에 'timestamp' 필드가 없습니다. '{expected_event_time_col}'을 null로 채웁니다. Iceberg 테이블 스키마에서 해당 컬럼이 필수라면 문제가 발생할 수 있습니다.")
+        parsed_df = parsed_df.withColumn(expected_event_time_col, lit(None).cast(TimestampType()))
+
+    print(f"DEBUG: Schema of parsed_df AFTER attempting to add {expected_event_time_col}:") # 디버그 로그 추가
+    parsed_df.printSchema()
+
+    # 최종 확인: event_time 컬럼이 실제로 추가되었는지 확인
+    if expected_event_time_col not in parsed_df.columns:
+        print(f"CRITICAL ERROR: '{expected_event_time_col}' 컬럼이 parsed_df에 최종적으로 추가되지 않았습니다. 로직 점검이 시급합니다.")
+        # 이 경우, 스키마 불일치로 Iceberg 쓰기 실패 가능성 매우 높음
+
+    # 1. 원본 데이터를 Iceberg 테이블에 저장하는 스트리밍 쿼리
+    raw_data_query = parsed_df.writeStream \
         .format("iceberg") \
         .outputMode("append") \
-        .option("checkpointLocation", args.checkpoint_location) \
-        .trigger(processingTime=args.processing_time_trigger) \
-        .toTable(full_iceberg_table_name)
+        .option("checkpointLocation", f"{args.checkpoint_location}/raw_data") \
+        .toTable(raw_data_table)
 
-    query.awaitTermination()
+    # 2. 실시간 집계: 비디오별 'content_click' 이벤트 수 집계
+    #    (상태 저장(stateful) 스트리밍)
+    video_click_counts_df = parsed_df \
+        .filter(col("eventType") == "content_click") \
+        .groupBy("videoId", "title") \
+        .agg(
+            count("*").alias("click_count"),
+            # 집계 시점의 타임스탬프를 event_time으로 추가한다고 가정
+            # 실제로는 윈도우의 시작/종료 시간을 사용하거나 다른 논리가 필요할 수 있음
+            current_timestamp().alias("event_time") 
+            )
+
+    # 집계 결과를 다른 Iceberg 테이블에 저장하는 스트리밍 쿼리
+    # outputMode를 "update" 또는 "complete"로 사용 (집계 유형에 따라 다름)
+    # "update" 모드는 변경된 행만 업데이트 (워터마크 필요할 수 있음)
+    # "complete" 모드는 전체 집계 결과를 매번 덮어씀 (상태가 크지 않을 때 유용)
+    # 여기서는 간단히 "update" 모드를 사용. (Iceberg는 MERGE INTO를 통해 update 모드 지원)
+    aggregated_data_query = video_click_counts_df.writeStream \
+        .format("iceberg") \
+        .outputMode("update") \
+        .option("checkpointLocation", f"{args.checkpoint_location}/video_clicks_summary") \
+        .trigger(processingTime=args.processing_time_trigger) \
+        .toTable(video_clicks_summary_table)
+
+    try:
+        # 여러 스트리밍 쿼리를 동시에 실행하려면 awaitTermination()을 직접 호출하기보다
+        # SparkSession.streams.awaitAnyTermination() 또는 각 쿼리를 별도 스레드에서 관리해야 할 수 있습니다.
+        # 여기서는 간단히 마지막 쿼리에 대해 awaitTermination()을 호출합니다.
+        # 더 견고한 관리를 위해서는 spark.streams.awaitAnyTermination() 사용을 고려하세요.
+        print(f"🚀 원본 데이터 스트림 시작: {raw_data_table}")
+        print(f"🚀 비디오 클릭 수 집계 스트림 시작: {video_clicks_summary_table}")
+        spark.streams.awaitAnyTermination() # 모든 활성 스트림 중 하나라도 종료될 때까지 대기
+    except Exception as e:
+        error_message = f"""
+❌ *Spark 스트리밍 쿼리 오류 발생!*
+*오류 내용:* `{str(e)}`
+*Iceberg 테이블 (원본):* `{raw_data_table}`
+*Iceberg 테이블 (집계):* `{video_clicks_summary_table}`
+*참고:* 스키마 변경으로 인한 문제일 수 있습니다.
+"""
+        send_slack_notification(args.slack_webhook_url, error_message)
+        raise  # 에러를 다시 발생시켜 Airflow 태스크 실패 처리
+
+
 
 if __name__ == "__main__":
     main()
