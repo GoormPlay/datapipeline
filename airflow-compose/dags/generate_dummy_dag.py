@@ -23,8 +23,8 @@ except ImportError:
 
 from utils.slack_fail_noti import task_fail_slack_alert
 
-kafka_cluster = '43.202.109.64:9092,3.38.172.147:9092,43.203.178.64:9092'
-SCHEMA_REGISTRY_URL = 'http://43.202.109.64:8081' # Schema Registry URL
+kafka_cluster = '43.202.164.175:9092,3.35.225.227:9092,3.34.180.9:9092'
+SCHEMA_REGISTRY_URL = 'http://43.202.164.175:8081' # Schema Registry URL
 KAFKA_TOPIC_AVRO = 'userlog-avro-topic'         # Avro 메시지를 위한 Kafka 토픽
 
 # Avro 스키마 정의 (make_event 함수 구조 기반)
@@ -185,7 +185,7 @@ with DAG(
     description="Generates dummy user log data in Avro format to Kafka", # 설명 변경
     start_date=datetime(2025, 6, 12),
     catchup=False,
-    schedule_interval='0 * * * *', # 스케줄 변경 (예시)
+    schedule_interval='0 1 * * *', # 스케줄 변경 (예시)
     tags=['dummy', 'avro', 'kafka'] # 태그 변경
 ) as dag:
     

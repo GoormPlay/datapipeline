@@ -157,6 +157,8 @@ def main():
     # SparkSession
     spark = SparkSession.builder \
         .appName("KafkaToIceberg") \
+        .config("spark.driver.bindAddress", "127.0.0.1") \
+        .config("spark.driver.host", "127.0.0.1") \
         .config(f"spark.sql.catalog.{args.iceberg_catalog_name}", "org.apache.iceberg.spark.SparkCatalog") \
         .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.type", "hadoop") \
         .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.warehouse", args.iceberg_warehouse_path) \
@@ -177,6 +179,7 @@ def main():
         .option("kafka.bootstrap.servers", args.kafka_brokers) \
         .option("subscribe", args.kafka_topic) \
         .option("startingOffsets", "latest") \
+        .option("failOnDataLoss", "false") \
         .load()
 
     # 원본 데이터 파싱 및 전처리
@@ -252,7 +255,7 @@ def main():
     # 여기서는 간단히 "update" 모드를 사용. (Iceberg는 MERGE INTO를 통해 update 모드 지원)
     aggregated_data_query = video_click_counts_df.writeStream \
         .format("iceberg") \
-        .outputMode("update") \
+        .outputMode("complete") \
         .option("checkpointLocation", f"{args.checkpoint_location}/video_clicks_summary") \
         .trigger(processingTime=args.processing_time_trigger) \
         .toTable(video_clicks_summary_table)
