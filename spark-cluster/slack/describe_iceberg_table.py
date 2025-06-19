@@ -22,7 +22,7 @@ ICEBERG_TABLE_NAME = "user_logs"           # 예: "user_activity_logs" (스키�
 # spark.packages 설정을 참고할 수 있습니다.
 # 만약 config.yaml에 org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.2 와 같은 형식으로 있다면 그대로 사용합니다.
 # hadoop-aws 패키지도 필요합니다. config.yaml과 일치하도록 수정합니다.
-ICEBERG_PACKAGES = "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.3.1,org.apache.hadoop:hadoop-aws:3.3.2,com.amazonaws:aws-java-sdk-bundle:1.12.262"
+ICEBERG_PACKAGES = "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.2,org.apache.hadoop:hadoop-aws:3.3.2,com.amazonaws:aws-java-sdk-bundle:1.12.262"
 # 참고: hadoop-aws 버전(3.3.2)과 호환되는 aws sdk bundle 버전(1.12.262)을 사용합니다.
 # Spark 3.3.x 이하는 com.amazonaws:aws-java-sdk-bundle:1.12.x 대를 사용 할 수 있습니다.
 

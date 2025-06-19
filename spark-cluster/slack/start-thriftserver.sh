@@ -3,7 +3,7 @@
 # Spark 설정 (config.yaml 참조)
 SPARK_MASTER="local" # config.yaml: spark.master
 # 필요한 패키지
-SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.3.1,org.apache.hadoop:hadoop-aws:3.3.2,com.amazonaws:aws-java-sdk-bundle:1.12.262"
+SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.2,org.apache.hadoop:hadoop-aws:3.3.2,com.amazonaws:aws-java-sdk-bundle:1.12.262"
 
 # Iceberg 설정 (config.yaml: iceberg 참조)
 ICEBERG_CATALOG_NAME="userlogs_catalog" # config.yaml: iceberg.catalog_name
@@ -30,6 +30,7 @@ $SPARK_HOME/sbin/start-thriftserver.sh \
   --conf spark.sql.catalog.${ICEBERG_CATALOG_NAME}.type=hadoop \
   --conf spark.sql.catalog.${ICEBERG_CATALOG_NAME}.warehouse=${ICEBERG_WAREHOUSE_PATH} \
   --conf spark.sql.catalog.spark_catalog.warehouse=${ICEBERG_WAREHOUSE_PATH} \
+  --conf spark.sql.defaultCatalog=${ICEBERG_CATALOG_NAME} \
   --conf spark.hadoop.fs.s3a.endpoint=${S3_ENDPOINT} \
   --conf spark.hadoop.fs.s3a.access.key=${S3_ACCESS_KEY} \
   --conf spark.hadoop.fs.s3a.secret.key=${S3_SECRET_KEY} \

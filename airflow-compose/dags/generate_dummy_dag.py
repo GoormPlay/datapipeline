@@ -23,8 +23,8 @@ except ImportError:
 
 from utils.slack_fail_noti import task_fail_slack_alert
 
-kafka_cluster = '43.202.164.175:9092,3.35.225.227:9092,3.34.180.9:9092'
-SCHEMA_REGISTRY_URL = 'http://43.202.164.175:8081' # Schema Registry URL
+kafka_cluster = '43.203.143.250:9092,3.38.134.186:9092,43.203.175.250:9092'
+SCHEMA_REGISTRY_URL = 'http://43.203.143.250:8081' # Schema Registry URL
 KAFKA_TOPIC_AVRO = 'userlog-avro-topic'         # Avro 메시지를 위한 Kafka 토픽
 
 # Avro 스키마 정의 (make_event 함수 구조 기반)

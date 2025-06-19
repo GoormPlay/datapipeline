@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, to_timestamp, lit, current_timestamp, count # lit 추가
+from pyspark.sql.functions import col, to_timestamp, count, window, when, current_timestamp
 from pyspark.sql.avro.functions import from_avro
 from pyspark.sql.types import *
 import argparse
@@ -7,59 +7,56 @@ import requests
 import hashlib
 import json
 import boto3
+import logging
 from botocore.exceptions import ClientError
 
-### 스키마 유틸 ###
 
-def avro_type_to_spark_type(avro_type):
-    if isinstance(avro_type, str):
-        return {
-            "string": StringType(),
-            "int": IntegerType(),
-            "long": LongType(),
-            "boolean": BooleanType(),
-            "float": FloatType(),
-            "double": DoubleType(),
-            "bytes": BinaryType()
-        }.get(avro_type, StringType())
-    if isinstance(avro_type, list):
-        non_null = [t for t in avro_type if t != "null"]
-        return avro_type_to_spark_type(non_null[0]) if non_null else StringType()
-    if isinstance(avro_type, dict):
-        type_ = avro_type["type"]
-        if type_ == "record":
-            return StructType([
-                StructField(f["name"], avro_type_to_spark_type(f["type"]))
-                for f in avro_type["fields"]
-            ])
-        elif type_ == "array":
-            return ArrayType(avro_type_to_spark_type(avro_type["items"]))
-        elif type_ == "map":
-            return MapType(StringType(), avro_type_to_spark_type(avro_type["values"]))
-    return StringType()
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('kafka-to-iceberg')
+logger.setLevel(logging.DEBUG)
 
-def avro_json_to_spark_schema(avro_schema_str: str) -> StructType:
-    avro_json = json.loads(avro_schema_str)
-    return StructType([
-        StructField(f["name"], avro_type_to_spark_type(f["type"]), True)
-        for f in avro_json["fields"]
-    ])
-
-### 스키마 관리 ###
+### 스키마 레지스트리 관련 함수 ###
 
 def fetch_avro_schema(schema_registry_url, subject):
+    """스키마 레지스트리에서 최신 Avro 스키마 가져오기"""
     url = f"{schema_registry_url}/subjects/{subject}/versions/latest"
-    response = requests.get(url)
-    response.raise_for_status()
-    schema_data = response.json()
-    return schema_data['schema'], schema_data['version']
+    logger.debug(f"스키마 레지스트리에서 스키마 가져오기 시도: URL='{url}'")
+    try:
+        response = requests.get(url, timeout=10) # 타임아웃 설정
+        response.raise_for_status()
+        schema_data = response.json()
+        if 'schema' not in schema_data or not schema_data['schema']:
+            err_msg = "스키마 레지스트리 응답에 'schema' 필드가 없거나 비어 있습니다."
+            logger.error(err_msg)
+            raise ValueError(err_msg)
+        if 'version' not in schema_data:
+            err_msg = "스키마 레지스트리 응답에 'version' 필드가 없습니다."
+            logger.error(err_msg)
+            raise ValueError(err_msg)
+        logger.info(f"스키마 레지스트리에서 스키마 성공적으로 가져옴: 버전 {schema_data['version']}, Subject='{subject}'")
+        return schema_data['schema'], schema_data['version']
+    except requests.exceptions.HTTPError as http_err:
+        logger.error(f"스키마 가져오기 중 HTTP 오류 발생: {http_err} - URL: {url} - 응답: {http_err.response.text if http_err.response else '응답 없음'}")
+        raise
+    except requests.exceptions.RequestException as req_err:
+        logger.error(f"스키마 가져오기 중 요청 오류 발생: {req_err} - URL: {url}")
+        raise
+    except ValueError as val_err: # JSON 파싱 또는 응답 형식 오류
+        logger.error(f"스키마 응답 파싱 중 오류 또는 잘못된 형식: {val_err} - URL: {url}")
+        raise
 
 def get_schema_hash(schema_str):
+    """스키마 문자열의 해시값 계산"""
     schema_dict = json.loads(schema_str)
     normalized = json.dumps(schema_dict, sort_keys=True)
     return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
 
 def get_last_schema_hash_from_s3(s3_client, bucket, key):
+    """S3에서 이전에 저장된 스키마 해시 가져오기"""
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=key)
         return obj['Body'].read().decode('utf-8')
@@ -67,219 +64,310 @@ def get_last_schema_hash_from_s3(s3_client, bucket, key):
         if e.response['Error']['Code'] == 'NoSuchKey':
             return None
         else:
+            logger.error(f"S3에서 스키마 해시 가져오기 실패: {str(e)}")
             raise
 
 def save_schema_hash_to_s3(s3_client, bucket, key, schema_hash):
+    """S3에 스키마 해시 저장"""
     s3_client.put_object(Bucket=bucket, Key=key, Body=schema_hash.encode('utf-8'))
+    logger.info(f"스키마 해시 S3에 저장됨: {bucket}/{key}")
 
 def save_schema_to_s3(s3_client, bucket, key, schema_str):
+    """S3에 스키마 문자열 저장"""
     s3_client.put_object(Bucket=bucket, Key=key, Body=schema_str.encode('utf-8'))
+    logger.info(f"스키마 파일 S3에 저장됨: {bucket}/{key}")
 
 def send_slack_notification(webhook_url, message):
+    """Slack에 알림 전송"""
     if webhook_url:
         try:
-            response = requests.post(webhook_url, json={'text': message}, timeout=10) # 타임아웃 추가
+            response = requests.post(webhook_url, json={'text': message}, timeout=10)
             if response.status_code == 200:
-                print(f"✅ Slack 알림 전송 성공 (상태 코드: {response.status_code})")
+                logger.info("✅ Slack 알림 전송 성공")
             else:
-                # 개인 정보 보호를 위해 URL의 일부만 로깅
-                safe_url = webhook_url[:webhook_url.find('hooks.slack.com/')+len('hooks.slack.com/')] + '...' if 'hooks.slack.com/' in webhook_url else "URL 형식 오류"
-                print(f"❌ Slack 알림 전송 실패 (상태 코드: {response.status_code})")
-                print(f"    Webhook URL (일부): {safe_url}")
-                print(f"    응답 내용: {response.text}") # Slack의 응답 내용 출력
+                logger.warning(f"❌ Slack 알림 전송 실패 (상태 코드: {response.status_code})")
         except requests.exceptions.RequestException as e:
-            print(f"❌ Slack 알림 전송 중 예외 발생: {e}")
+            logger.error(f"❌ Slack 알림 전송 중 예외 발생: {str(e)}")
     else:
-        print("⚠️ Slack Webhook URL이 없어 알림 생략됨")
+        logger.info("⚠️ Slack Webhook URL이 없어 알림 생략됨")
+
+### Iceberg 처리 함수 ###
+
+def process_video_clicks_batch(batch_df, batch_id, video_clicks_summary_table_name):
+    """
+    각 마이크로배치를 Iceberg 테이블에 upsert 처리하는 함수
+    """
+    if batch_df.isEmpty():
+        logger.info(f"🔄 배치 {batch_id}: 데이터 없음, 처리 건너뜀")
+        return
+    
+    logger.info(f"🔄 배치 {batch_id}: {batch_df.count()} 레코드 처리 시작 (대상 테이블: {video_clicks_summary_table_name})")
+    
+    # 디버깅: 배치 데이터 샘플 확인
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"배치 {batch_id} 샘플 데이터:")
+        batch_df.show(5, truncate=False)
+    
+    # Iceberg 테이블에 MERGE INTO 연산 수행 (upsert 처리)
+    temp_view_name = f"updates_view_for_batch_{str(batch_id)}"
+    batch_df.createOrReplaceTempView(temp_view_name)
+    
+    spark = batch_df.sparkSession 
+    
+    merge_sql = f"""
+    MERGE INTO {video_clicks_summary_table_name} t
+    USING {temp_view_name} s
+    ON t.window_start = s.window_start AND t.videoId = s.videoId
+    WHEN MATCHED THEN 
+      UPDATE SET t.window_end = s.window_end, t.title = s.title, t.click_count = s.click_count
+    WHEN NOT MATCHED THEN
+      INSERT (window_start, window_end, videoId, title, click_count)
+      VALUES (s.window_start, s.window_end, s.videoId, s.title, s.click_count)
+    """
+    logger.debug(f"실행할 MERGE SQL (배치 {batch_id}):\n{merge_sql}")
+    
+    try:
+        spark.sql(merge_sql)
+        logger.info(f"✅ 배치 {batch_id}: 처리 완료 (대상 테이블: {video_clicks_summary_table_name})")
+    except Exception as e:
+        logger.error(f"❌ 배치 {batch_id} 처리 실패: {str(e)}")
+        raise
+    finally:
+        # 사용한 임시 뷰 삭제
+        spark.catalog.dropTempView(temp_view_name)
 
 ### MAIN ###
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--schema_registry_url", required=True)
-    parser.add_argument("--schema_subject", required=True)
-    parser.add_argument("--kafka_brokers", required=True)
-    parser.add_argument("--kafka_topic", required=True)
-    parser.add_argument("--iceberg_catalog_name", required=True)
-    parser.add_argument("--iceberg_warehouse_path", required=True)
-    parser.add_argument("--iceberg_db_name", required=True)
-    parser.add_argument("--iceberg_table_name", required=True)
-    parser.add_argument("--checkpoint_location", required=True)
-    parser.add_argument("--s3_endpoint", required=True)
-    parser.add_argument("--s3_access_key", required=True)
-    parser.add_argument("--s3_secret_key", required=True)
-    parser.add_argument("--processing_time_trigger", default="30 minutes")
-    parser.add_argument("--schema_version_s3_bucket", required=True)
-    parser.add_argument("--schema_version_s3_key", required=True)
-    parser.add_argument("--slack_webhook_url", default=None)
+    try:
+        parser = argparse.ArgumentParser(description='Kafka에서 데이터를 읽어 Iceberg 테이블에 저장하는 ETL')
+        parser.add_argument("--schema_registry_url", required=True, help='스키마 레지스트리 URL')
+        parser.add_argument("--schema_subject", required=True, help='스키마 서브젝트 이름')
+        parser.add_argument("--kafka_brokers", required=True, help='Kafka 브로커 목록 (콤마로 구분)')
+        parser.add_argument("--kafka_topic", required=True, help='Kafka 토픽 이름')
+        parser.add_argument("--iceberg_catalog_name", required=True, help='Iceberg 카탈로그 이름')
+        parser.add_argument("--iceberg_warehouse_path", required=True, help='Iceberg 웨어하우스 경로')
+        parser.add_argument("--iceberg_db_name", required=True, help='Iceberg 데이터베이스 이름')
+        parser.add_argument("--iceberg_table_name", required=True, help='원본 데이터 저장할 테이블 이름')
+        parser.add_argument("--checkpoint_location", required=True, help='체크포인트 위치')
+        parser.add_argument("--s3_endpoint", required=True, help='S3 엔드포인트')
+        parser.add_argument("--s3_access_key", required=True, help='S3 액세스 키')
+        parser.add_argument("--s3_secret_key", required=True, help='S3 시크릿 키')
+        parser.add_argument("--processing_time_trigger", default="30 seconds", help='처리 시간 트리거 (예: "30 seconds")')
+        parser.add_argument("--schema_version_s3_bucket", required=True, help='스키마 버전 저장할 S3 버킷')
+        parser.add_argument("--schema_version_s3_key", required=True, help='스키마 버전 저장할 S3 키')
+        parser.add_argument("--slack_webhook_url", default=None, help='Slack 웹훅 URL')
 
-    args = parser.parse_args()
+        args = parser.parse_args()
+        logger.info("입력 인수 파싱 완료")
 
-    # S3 client
-    s3_client = boto3.client(
-        's3',
-        endpoint_url=args.s3_endpoint,
-        aws_access_key_id=args.s3_access_key,
-        aws_secret_access_key=args.s3_secret_key
-    )
+        # S3 클라이언트 생성
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=args.s3_endpoint,
+            aws_access_key_id=args.s3_access_key,
+            aws_secret_access_key=args.s3_secret_key
+        )
+        logger.info(f"S3 클라이언트 생성 완료 (엔드포인트: {args.s3_endpoint})")
 
-    # Fetch current schema
-    current_schema_str, current_version = fetch_avro_schema(
-        args.schema_registry_url, args.schema_subject
-    )
-    print("DEBUG: Fetched Avro schema string from Schema Registry:") # 디버그 로그 추가
-    print(current_schema_str)
+        # 스키마 레지스트리에서 현재 스키마 가져오기
+        try:
+            current_schema_str, current_version = fetch_avro_schema(
+                args.schema_registry_url, args.schema_subject
+            )
+        except Exception as e: # fetch_avro_schema 내부에서 이미 로깅 및 예외 발생
+            error_message = f"CRITICAL ERROR: 스키마 가져오기 실패, 스크립트 중단. 원인: {e}"
+            logger.error(error_message)
+            send_slack_notification(args.slack_webhook_url, error_message)
+            raise
+        
+        if not current_schema_str:
+            # 이 경우는 fetch_avro_schema 내부의 예외 처리로 인해 발생하기 어려움
+            error_message = f"CRITICAL ERROR: 스키마 레지스트리에서 가져온 Avro 스키마가 비어있습니다 (URL: {args.schema_registry_url}, Subject: {args.schema_subject}). 진행할 수 없습니다."
+            logger.error(error_message)
+            send_slack_notification(args.slack_webhook_url, error_message)
+            raise ValueError(error_message)
+        
+        logger.debug(f"가져온 스키마 문자열 (일부): '{current_schema_str[:200]}...'")
 
-    current_schema_hash = get_schema_hash(current_schema_str)
-    spark_schema = avro_json_to_spark_schema(current_schema_str)
+        # 스키마 해시 계산 및 S3에 저장된 이전 해시와 비교
+        current_schema_hash = get_schema_hash(current_schema_str) # current_schema_str이 유효할 때만 호출됨
+        logger.info(f"현재 스키마 해시 계산 완료: {current_schema_hash}")
 
-    # Check for schema change
-    # (스키마 변경 감지 및 알림 로직은 동일하게 유지)
-    hash_s3_key = args.schema_version_s3_key.replace(".version", ".hash")
-    last_schema_hash = get_last_schema_hash_from_s3(
-        s3_client, args.schema_version_s3_bucket, hash_s3_key
-    )
+        hash_s3_key = args.schema_version_s3_key.replace(".version", ".hash")
+        last_schema_hash = get_last_schema_hash_from_s3(
+            s3_client, args.schema_version_s3_bucket, hash_s3_key
+        )
 
-    if last_schema_hash != current_schema_hash:
-        msg = f"""
+        # 스키마 변경 감지 및 알림
+        if last_schema_hash != current_schema_hash:
+            msg = f"""
 ✨ *Avro 스키마 변경 감지!*
 *Subject:* `{args.schema_subject}`
 *이전 해시:* `{last_schema_hash or '없음'}`
 *신규 해시:* `{current_schema_hash}`
+*버전:* `{current_version}`
 """
-        send_slack_notification(args.slack_webhook_url, msg)
-        save_schema_hash_to_s3(s3_client, args.schema_version_s3_bucket, hash_s3_key, current_schema_hash)
-        schema_key = args.schema_version_s3_key.replace(".version", f"_v{current_version}.avsc")
-        save_schema_to_s3(s3_client, args.schema_version_s3_bucket, schema_key, current_schema_str)
-    else:
-        print("✅ Avro 스키마 변경 없음")
-
-    # SparkSession
-    spark = SparkSession.builder \
-        .appName("KafkaToIceberg") \
-        .config("spark.driver.bindAddress", "127.0.0.1") \
-        .config("spark.driver.host", "127.0.0.1") \
-        .config(f"spark.sql.catalog.{args.iceberg_catalog_name}", "org.apache.iceberg.spark.SparkCatalog") \
-        .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.type", "hadoop") \
-        .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.warehouse", args.iceberg_warehouse_path) \
-        .config("spark.hadoop.fs.s3a.endpoint", args.s3_endpoint) \
-        .config("spark.hadoop.fs.s3a.access.key", args.s3_access_key) \
-        .config("spark.hadoop.fs.s3a.secret.key", args.s3_secret_key) \
-        .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-        .getOrCreate()
-
-    # 원본 데이터 저장 테이블
-    raw_data_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.{args.iceberg_table_name}"
-    # 집계 데이터 저장 테이블 (예시: 비디오별 클릭 수)
-    video_clicks_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.video_clicks_summary"
-
-    # Kafka ingestion
-    df = spark.readStream \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", args.kafka_brokers) \
-        .option("subscribe", args.kafka_topic) \
-        .option("startingOffsets", "latest") \
-        .option("failOnDataLoss", "false") \
-        .load()
-
-    # 원본 데이터 파싱 및 전처리
-    # 1. Avro 디코딩 (PERMISSIVE 모드로 변경하여 일부 레코드 오류에 강인하게)
-    decoded_df = df.select(
-        from_avro(col("value"), current_schema_str, {"mode": "PERMISSIVE"}).alias("data")
-    )
-
-    # 2. 파싱 실패 레코드 필터링 (data 컬럼이 null인 경우)
-    #    이러한 레코드는 별도로 로깅하거나 Dead Letter Queue(DLQ)로 보낼 수 있습니다.
-    parsed_df = decoded_df.filter(col("data").isNotNull()).select("data.*")
-    print("DEBUG: Schema of parsed_df AFTER from_avro and select(\"data.*\"):") # 디버그 로그 추가
-    parsed_df.printSchema() 
-
-    # 3. event_time 컬럼 추가 (타임스탬프 변환)
-    #    'timestamp' 필드의 실제 데이터 타입에 따라 변환 방식이 달라질 수 있습니다.
-    #    Avro 스키마에서 'timestamp'가 long (밀리초) 또는 string (ISO 형식 등)일 수 있습니다.
-    expected_event_time_col = "event_time" # 사용할 컬럼명 변수화
-
-    if "timestamp" in parsed_df.columns:
-        timestamp_dtype = parsed_df.schema["timestamp"].dataType
-        print(f"INFO: 'timestamp' 컬럼 발견. 타입: {timestamp_dtype}")
-        if isinstance(timestamp_dtype, LongType):
-            # Avro 'long' 타입 (밀리초 단위 Unix timestamp로 가정)
-            parsed_df = parsed_df.withColumn(expected_event_time_col, (col("timestamp") / 1000).cast(TimestampType()))
-            print(f"INFO: 'timestamp' (LongType) 필드를 밀리초 epoch로 간주하여 '{expected_event_time_col}' (TimestampType)으로 변환했습니다.")
-        elif isinstance(timestamp_dtype, StringType):
-            # Avro 'string' 타입
-            parsed_df = parsed_df.withColumn(expected_event_time_col, to_timestamp(col("timestamp")))
-            print(f"INFO: 'timestamp' (StringType) 필드를 '{expected_event_time_col}' (TimestampType)으로 변환했습니다 (to_timestamp 사용).")
-        elif isinstance(timestamp_dtype, (IntegerType, DoubleType, FloatType)): # 숫자형 (초 단위 Unix timestamp로 가정)
-            parsed_df = parsed_df.withColumn(expected_event_time_col, col("timestamp").cast(TimestampType()))
-            print(f"INFO: 'timestamp' ({str(timestamp_dtype)}) 필드를 초단위 epoch로 간주하여 '{expected_event_time_col}' (TimestampType)으로 변환했습니다.")
+            logger.info("Avro 스키마 변경 감지됨!")
+            send_slack_notification(args.slack_webhook_url, msg)
+            save_schema_hash_to_s3(s3_client, args.schema_version_s3_bucket, hash_s3_key, current_schema_hash)
+            schema_key = args.schema_version_s3_key.replace(".version", f"_v{current_version}.avsc")
+            save_schema_to_s3(s3_client, args.schema_version_s3_bucket, schema_key, current_schema_str)
         else:
-            # 지원하지 않는 타입이거나, 이미 TimestampType일 수도 있습니다.
-            print(f"경고: 'timestamp' 컬럼의 타입({str(timestamp_dtype)})이 예상과 다릅니다. '{expected_event_time_col}'을 null로 채웁니다.")
-            parsed_df = parsed_df.withColumn(expected_event_time_col, lit(None).cast(TimestampType()))
-    else:
-        print(f"경고: Avro 데이터에 'timestamp' 필드가 없습니다. '{expected_event_time_col}'을 null로 채웁니다. Iceberg 테이블 스키마에서 해당 컬럼이 필수라면 문제가 발생할 수 있습니다.")
-        parsed_df = parsed_df.withColumn(expected_event_time_col, lit(None).cast(TimestampType()))
+            logger.info("Avro 스키마 변경 없음")
 
-    print(f"DEBUG: Schema of parsed_df AFTER attempting to add {expected_event_time_col}:") # 디버그 로그 추가
-    parsed_df.printSchema()
+        # SparkSession 설정
+        spark = SparkSession.builder \
+            .appName("KafkaToIcebergETL") \
+            .config(f"spark.sql.catalog.{args.iceberg_catalog_name}", "org.apache.iceberg.spark.SparkCatalog") \
+            .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.type", "hadoop") \
+            .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.warehouse", args.iceberg_warehouse_path) \
+            .config("spark.hadoop.fs.s3a.endpoint", args.s3_endpoint) \
+            .config("spark.hadoop.fs.s3a.access.key", args.s3_access_key) \
+            .config("spark.hadoop.fs.s3a.secret.key", args.s3_secret_key) \
+            .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+            .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+            .getOrCreate()
 
-    # 최종 확인: event_time 컬럼이 실제로 추가되었는지 확인
-    if expected_event_time_col not in parsed_df.columns:
-        print(f"CRITICAL ERROR: '{expected_event_time_col}' 컬럼이 parsed_df에 최종적으로 추가되지 않았습니다. 로직 점검이 시급합니다.")
-        # 이 경우, 스키마 불일치로 Iceberg 쓰기 실패 가능성 매우 높음
+        logger.info("SparkSession 생성 완료")
 
-    # 1. 원본 데이터를 Iceberg 테이블에 저장하는 스트리밍 쿼리
-    raw_data_query = parsed_df.writeStream \
-        .format("iceberg") \
-        .outputMode("append") \
-        .option("checkpointLocation", f"{args.checkpoint_location}/raw_data") \
-        .toTable(raw_data_table)
+        # Iceberg 테이블 이름 정의
+        raw_data_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.{args.iceberg_table_name}"
+        video_clicks_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.video_clicks_summary"
 
-    # 2. 실시간 집계: 비디오별 'content_click' 이벤트 수 집계
-    #    (상태 저장(stateful) 스트리밍)
-    video_click_counts_df = parsed_df \
-        .filter(col("eventType") == "content_click") \
-        .groupBy("videoId", "title") \
-        .agg(
-            count("*").alias("click_count"),
-            # 집계 시점의 타임스탬프를 event_time으로 추가한다고 가정
-            # 실제로는 윈도우의 시작/종료 시간을 사용하거나 다른 논리가 필요할 수 있음
-            current_timestamp().alias("event_time") 
+        # Kafka에서 데이터 읽기
+        df = spark.readStream \
+            .format("kafka") \
+            .option("kafka.bootstrap.servers", args.kafka_brokers) \
+            .option("subscribe", args.kafka_topic) \
+            .option("startingOffsets", "latest") \
+            .option("failOnDataLoss", "false") \
+            .load()
+
+        logger.info(f"Kafka 스트리밍 리더 설정 완료 (토픽: {args.kafka_topic})")
+
+        # Avro 디코딩
+        try:
+            decoded_df = df.select(
+                # Confluent 와이어 포맷 처리를 위해 Schema Registry URL 사용
+                from_avro(col("value"), None, {"mode": "PERMISSIVE", "schema.registry.url": args.schema_registry_url}).alias("data")
             )
+            logger.info("Avro 디코딩 설정 완료")
+        except Exception as e:
+            error_message = f"Avro 디코딩 설정 중 오류: {str(e)}"
+            logger.error(error_message)
+            send_slack_notification(args.slack_webhook_url, error_message)
+            raise
 
-    # 집계 결과를 다른 Iceberg 테이블에 저장하는 스트리밍 쿼리
-    # outputMode를 "update" 또는 "complete"로 사용 (집계 유형에 따라 다름)
-    # "update" 모드는 변경된 행만 업데이트 (워터마크 필요할 수 있음)
-    # "complete" 모드는 전체 집계 결과를 매번 덮어씀 (상태가 크지 않을 때 유용)
-    # 여기서는 간단히 "update" 모드를 사용. (Iceberg는 MERGE INTO를 통해 update 모드 지원)
-    aggregated_data_query = video_click_counts_df.writeStream \
-        .format("iceberg") \
-        .outputMode("complete") \
-        .option("checkpointLocation", f"{args.checkpoint_location}/video_clicks_summary") \
-        .trigger(processingTime=args.processing_time_trigger) \
-        .toTable(video_clicks_summary_table)
+        # 데이터 파싱: Avro에서 디코딩된 데이터를 명시적으로 Iceberg 테이블 형식에 맞게 변환
+        # 스키마 변경에 대응하기 위해 명시적인 필드 선택 및 매핑
+        try:
+            # 필요한 필드 명시적 추출 (Avro 스키마와 Iceberg 테이블 간 매핑)
+            parsed_df = decoded_df \
+                .filter(col("data").isNotNull()) \
+                .select(
+                    # 필드명을 명시적으로 지정하여 매핑
+                    # Avro 스키마와 Iceberg 스키마 간의 중간 변환 계층 역할
+                    col("data.eventType").alias("eventType"),
+                    col("data.videoId").alias("videoId"), 
+                    col("data.title").alias("title"),
+                    col("data.userId").alias("userId"),
+                    # 여기에 필요한 다른 필드 추가
+                    
+                    # 타임스탬프 필드 특별 처리
+                    # 타입에 따라 적절히 변환
+                    when(col("data.timestamp").isNotNull(), 
+                         when(col("data.timestamp").cast("string").like("%:%"), 
+                              to_timestamp(col("data.timestamp")))
+                         .otherwise((col("data.timestamp") / 1000).cast("timestamp")))
+                    .otherwise(current_timestamp())
+                    .alias("event_time")
+                )
+            logger.info("데이터 파싱 및 변환 설정 완료")
+        except Exception as e:
+            error_message = f"데이터 파싱 및 변환 설정 중 오류: {str(e)}"
+            logger.error(error_message)
+            send_slack_notification(args.slack_webhook_url, error_message)
+            raise
 
-    try:
-        # 여러 스트리밍 쿼리를 동시에 실행하려면 awaitTermination()을 직접 호출하기보다
-        # SparkSession.streams.awaitAnyTermination() 또는 각 쿼리를 별도 스레드에서 관리해야 할 수 있습니다.
-        # 여기서는 간단히 마지막 쿼리에 대해 awaitTermination()을 호출합니다.
-        # 더 견고한 관리를 위해서는 spark.streams.awaitAnyTermination() 사용을 고려하세요.
-        print(f"🚀 원본 데이터 스트림 시작: {raw_data_table}")
-        print(f"🚀 비디오 클릭 수 집계 스트림 시작: {video_clicks_summary_table}")
-        spark.streams.awaitAnyTermination() # 모든 활성 스트림 중 하나라도 종료될 때까지 대기
+        # 디버깅: 변환된 데이터 구조 확인
+        if logger.isEnabledFor(logging.DEBUG):
+            debug_query = parsed_df.writeStream \
+                .outputMode("append") \
+                .format("console") \
+                .option("truncate", "false") \
+                .option("numRows", 5) \
+                .start()
+            logger.debug("디버그 스트림 시작됨 (콘솔 출력)")
+
+        # 1. 원본 데이터를 Iceberg 테이블에 저장
+        try:
+            raw_data_query = parsed_df.writeStream \
+                .format("iceberg") \
+                .outputMode("append") \
+                .option("checkpointLocation", f"{args.checkpoint_location}/raw_data") \
+                .toTable(raw_data_table)
+            logger.info(f"원본 데이터 Iceberg 테이블 스트림 시작됨: {raw_data_table}")
+        except Exception as e:
+            error_message = f"원본 데이터 Iceberg 저장 설정 중 오류: {str(e)}"
+            logger.error(error_message)
+            send_slack_notification(args.slack_webhook_url, error_message)
+            raise
+
+        # 2. 비디오 클릭 집계
+        try:
+            # content_click 이벤트만 필터링
+            video_click_counts_df = parsed_df \
+                .filter(col("eventType") == "content_click") \
+                .withWatermark("event_time", "10 minutes") \
+                .groupBy(
+                    window(col("event_time"), "1 hour").alias("time_window"),
+                    col("videoId"),
+                    col("title")
+                ) \
+                .agg(count("*").alias("click_count")) \
+                .select(
+                    col("time_window.start").alias("window_start"),
+                    col("time_window.end").alias("window_end"),
+                    col("videoId"),
+                    col("title"),
+                    col("click_count")
+                )
+
+            # foreachBatch를 사용하여 집계 결과 처리
+            aggregated_data_query = video_click_counts_df.writeStream \
+                .foreachBatch(lambda df, id: process_video_clicks_batch(df, id, video_clicks_summary_table)) \
+                .option("checkpointLocation", f"{args.checkpoint_location}/video_clicks_summary") \
+                .outputMode("update") \
+                .trigger(processingTime=args.processing_time_trigger) \
+                .start()
+                
+            logger.info(f"비디오 클릭 집계 스트림 시작됨: {video_clicks_summary_table}")
+        except Exception as e:
+            error_message = f"비디오 클릭 집계 설정 중 오류: {str(e)}"
+            logger.error(error_message)
+            send_slack_notification(args.slack_webhook_url, error_message)
+            # 이 오류는 치명적이지 않을 수 있으므로 원본 데이터 스트림은 유지
+            logger.warning("비디오 클릭 집계 스트림은 시작되지 않았지만, 원본 데이터 스트림은 계속됩니다.")
+
+        # 스트림 실행 상태 모니터링
+        try:
+            logger.info("모든 스트림 시작됨, 종료 대기 중...")
+            spark.streams.awaitAnyTermination()
+        except Exception as e:
+            error_message = f"스트림 실행 중 오류 발생: {str(e)}"
+            logger.error(error_message)
+            send_slack_notification(args.slack_webhook_url, error_message)
+            raise
+        finally:
+            logger.info("애플리케이션 종료...")
+            # 필요하면 리소스 정리 코드 추가
+
     except Exception as e:
-        error_message = f"""
-❌ *Spark 스트리밍 쿼리 오류 발생!*
-*오류 내용:* `{str(e)}`
-*Iceberg 테이블 (원본):* `{raw_data_table}`
-*Iceberg 테이블 (집계):* `{video_clicks_summary_table}`
-*참고:* 스키마 변경으로 인한 문제일 수 있습니다.
-"""
+        error_message = f"애플리케이션 실행 중 예기치 않은 오류: {str(e)}"
+        logger.error(error_message, exc_info=True)
         send_slack_notification(args.slack_webhook_url, error_message)
-        raise  # 에러를 다시 발생시켜 Airflow 태스크 실패 처리
-
-
+        raise
 
 if __name__ == "__main__":
     main()
