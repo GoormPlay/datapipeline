@@ -40,7 +40,7 @@ def fetch_avro_schema(schema_registry_url, subject):
 
     try:
         logger.debug(f"스키마 레지스트리에서 '{subject}' 서브젝트의 최신 버전 스키마 가져오기 시도...")
-        registered_schema = sr_client.get_latest_version(subject)
+        registered_schema = sr_client.get_latest_version(subject) # latest_version
         
         if registered_schema is None or registered_schema.schema is None or not registered_schema.schema.schema_str:
             err_msg = f"'{subject}' 서브젝트에 대한 스키마를 찾을 수 없거나 스키마 문자열이 비어 있습니다."
@@ -51,6 +51,7 @@ def fetch_avro_schema(schema_registry_url, subject):
         version = registered_schema.version
         logger.info(f"스키마 레지스트리에서 스키마 성공적으로 가져옴: 버전 {version}, Subject='{subject}'")
         return schema_str, version
+
     except SchemaRegistryError as e:
         logger.error(f"SchemaRegistryError 발생 (서브젝트: {subject}): {e}")
         # SchemaRegistryError는 HTTP 상태 코드 등을 포함할 수 있음
@@ -237,6 +238,7 @@ def main():
             .config("spark.hadoop.fs.s3a.access.key", args.s3_access_key) \
             .config("spark.hadoop.fs.s3a.secret.key", args.s3_secret_key) \
             .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+            .config("spark.hadoop.fs.s3a.aws.credentials.provider", "") \
             .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
             .getOrCreate()
 
@@ -245,6 +247,24 @@ def main():
         # Iceberg 테이블 이름 정의
         raw_data_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.{args.iceberg_table_name}"
         video_clicks_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.video_clicks_summary"
+
+        # 데이터베이스가 존재하지 않으면 생성
+        logger.info(f"Ensuring database {args.iceberg_catalog_name}.{args.iceberg_db_name} exists...")
+        spark.sql(f"CREATE DATABASE IF NOT EXISTS {args.iceberg_catalog_name}.{args.iceberg_db_name}")
+        logger.info(f"Database {args.iceberg_catalog_name}.{args.iceberg_db_name} ensured.")
+
+        # user_logs_iceberg_schema를 사용하여 user_logs 테이블이 존재하지 않으면 생성
+        # user_logs_iceberg_schema는 아래에서 정의되므로, 해당 정의 이후 또는 여기서 직접 사용
+        # 이 DDL은 user_logs_iceberg_schema 정의 이후로 옮기거나, 여기서 스키마를 다시 참조해야 합니다.
+        # 아래 user_logs_iceberg_schema 정의 후 DDL 실행 코드를 위치시키는 것이 더 깔끔합니다.
+        # (아래 user_logs_iceberg_schema 정의 후 관련 로직 추가됨)
+
+        # Kafka에서 데이터 읽기 (이 부분은 스키마 정의와 테이블 생성 로직 뒤로 이동하지 않아도 됨)
+        # ... (기존 Kafka 읽기 로직) ...
+        # 하지만, user_logs_iceberg_schema를 사용하는 테이블 생성 로직은
+        # 해당 스키마 변수가 정의된 이후에 와야 합니다.
+        # 현재 코드 흐름상 user_logs_iceberg_schema는 Kafka 데이터 처리 이후에 정의되므로,
+        # 테이블 생성 DDL은 그 이후에 위치해야 합니다.
 
         # Kafka에서 데이터 읽기
         df = spark.readStream \
@@ -257,13 +277,29 @@ def main():
 
         logger.info(f"Kafka 스트리밍 리더 설정 완료 (토픽: {args.kafka_topic})")
 
+         # #  get magic byte value
+        df = df.withColumn("magicByte", func.expr("substring(value, 1, 1)"))
+
+        #  get schema id from value
+        df = df.withColumn("valueSchemaId", func.expr("substring(value, 2, 4)"))
+
+        # remove first 5 bytes from value
+        df = df.withColumn("fixedValue", func.expr("substring(value, 6, length(value)-5)"))
+
+        # creating a new df with magicBytes, valueSchemaId & fixedValue
+        value_df = df.select("magicByte", "valueSchemaId", "fixedValue")
         # Avro 디코딩 (Confluent 와이어 포맷 처리)
         # current_schema_str은 스키마 변경 감지 및 S3 저장을 위해 사용되며,
         # from_avro는 schema.registry.url을 통해 스키마를 가져옵니다.
+        latest_version, _ = fetch_avro_schema(args.schema_registry_url, args.schema_subject)
         try:
-            decoded_df = df.select(
-                from_avro(col("value"), None, {"mode": "PERMISSIVE", "schema.registry.url": args.schema_registry_url}).alias("data")
-            ).select("data.*") # data 컬럼 내부 필드를 바로 펼침
+            fromAvroOptions = {"mode":"PERMISSIVE"}
+            from_avro_df = value_df.select(
+                from_avro(col("fixedValue"), latest_version, fromAvroOptions).alias("data")
+            )
+
+            decoded_df = from_avro_df.select("data.*")
+            decoded_df.printSchema()
             
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("Schema of decoded_df (after from_avro and select data.*):")
@@ -303,6 +339,43 @@ def main():
             logger.debug("Schema of df_with_event_timestamp:")
             df_with_event_timestamp.printSchema()
 
+        # Define the target Iceberg schema for user_logs table
+        # This schema should match the intended structure of your 'user_logs' Iceberg table.
+        user_logs_iceberg_schema = StructType([
+            StructField("videoId", StringType(), True),
+            StructField("title", StringType(), True),
+            StructField("userId", StringType(), True),
+            StructField("timestamp", LongType(), True), # Original timestamp from Avro
+            StructField("eventType", StringType(), True),
+            StructField("page", StringType(), True),
+            StructField("liked", BooleanType(), True),
+            StructField("review", StringType(), True),
+            StructField("rating", IntegerType(), True),
+            StructField("genre", ArrayType(StringType(), True), True),
+            StructField("recMovieList", StringType(), True),
+            StructField("event_timestamp", TimestampType(), True) # Derived event timestamp
+        ])
+        logger.info(f"Defined target Iceberg schema for 'user_logs': {user_logs_iceberg_schema.simpleString()}")
+
+        # user_logs_iceberg_schema를 사용하여 user_logs 테이블이 존재하지 않으면 생성
+        # (위에서 언급된 DDL 실행 로직을 여기에 위치)
+        logger.info(f"Ensuring table {raw_data_table} exists with the correct schema...")
+        columns_ddl_parts = []
+        for field in user_logs_iceberg_schema.fields:
+            columns_ddl_parts.append(f"`{field.name}` {field.dataType.simpleString()}")
+        columns_ddl = ", ".join(columns_ddl_parts)
+        
+        create_table_sql = f"CREATE TABLE IF NOT EXISTS {raw_data_table} ({columns_ddl}) USING iceberg"
+        # 필요시 파티셔닝 추가: e.g., PARTITIONED BY (days(event_timestamp))
+        spark.sql(create_table_sql)
+        logger.info(f"Table {raw_data_table} ensured.")
+        try:
+            spark.catalog.refreshTable(raw_data_table)
+            logger.info(f"Refreshed catalog for table {raw_data_table}")
+        except Exception as e_refresh:
+            # If the table truly didn't exist before the DDL, refreshTable might fail.
+            logger.warning(f"Could not refresh table {raw_data_table} in catalog (this might be okay if it was just created): {e_refresh}")
+
         # 1. 원본 데이터를 Iceberg user_logs 테이블에 저장 (느슨한 결합)
         logger.info("Iceberg 'user_logs' 테이블 저장 스트림 설정 시작...")
         select_exprs_for_user_logs = []
@@ -326,78 +399,79 @@ def main():
                 .option("checkpointLocation", f"{args.checkpoint_location}/raw_data") \
                 .toTable(raw_data_table)
             logger.info(f"원본 데이터 Iceberg 테이블 스트림 시작됨: {raw_data_table}")
+            raw_data_to_iceberg_query.show()
         except Exception as e:
             error_message = f"원본 데이터 Iceberg 저장 설정 중 오류: {str(e)}"
             logger.error(error_message)
             send_slack_notification(args.slack_webhook_url, error_message)
             raise
 
-        # 2. 비디오 클릭 집계
-        try:
-            aggregated_data_query = None # 초기화
-            # 집계는 event_timestamp 컬럼이 유효할 때만 수행
-            if "event_timestamp" in df_with_event_timestamp.columns and \
-               isinstance(df_with_event_timestamp.schema["event_timestamp"].dataType, TimestampType):
-                logger.info("'event_timestamp'을 사용하여 윈도우 집계를 수행합니다.")
+        # # 2. 비디오 클릭 집계
+        # try:
+        #     aggregated_data_query = None # 초기화
+        #     # 집계는 event_timestamp 컬럼이 유효할 때만 수행
+        #     if "event_timestamp" in df_with_event_timestamp.columns and \
+        #        isinstance(df_with_event_timestamp.schema["event_timestamp"].dataType, TimestampType):
+        #         logger.info("'event_timestamp'을 사용하여 윈도우 집계를 수행합니다.")
                 
-                df_for_aggregation = df_with_event_timestamp.select("videoId", "title", "eventType", "event_timestamp")
-                video_click_counts_df = df_for_aggregation \
-                .filter(col("eventType") == "content_click") \
-                .withWatermark("event_timestamp", "10 minutes") \
-                .groupBy(
-                    window(col("event_timestamp"), "1 hour").alias("time_window"),
-                    col("videoId"),
-                    col("title")
-                ) \
-                .agg(count("*").alias("click_count")) \
-                .select(
-                    col("time_window.start").alias("window_start"),
-                    col("time_window.end").alias("window_end"),
-                    col("videoId"),
-                    col("title"),
-                    col("click_count")
-                )
+        #         df_for_aggregation = df_with_event_timestamp.select("videoId", "title", "eventType", "event_timestamp")
+        #         video_click_counts_df = df_for_aggregation \
+        #         .filter(col("eventType") == "content_click") \
+        #         .withWatermark("event_timestamp", "5 minutes") \
+        #         .groupBy(
+        #             window(col("event_timestamp"), args.processing_time_trigger).alias("time_window"),
+        #             col("videoId"),
+        #             col("title")
+        #         ) \
+        #         .agg(count("*").alias("click_count")) \
+        #         .select(
+        #             col("time_window.start").alias("window_start"),
+        #             col("time_window.end").alias("window_end"),
+        #             col("videoId"),
+        #             col("title"),
+        #             col("click_count")
+        #         )
                 
-                if logger.isEnabledFor(logging.DEBUG): # pragma: no cover
-                    logger.debug("Schema of video_click_counts_df (for aggregation):")
-                    video_click_counts_df.printSchema()
+        #         if logger.isEnabledFor(logging.DEBUG): # pragma: no cover
+        #             logger.debug("Schema of video_click_counts_df (for aggregation):")
+        #             video_click_counts_df.printSchema()
 
-                aggregated_data_query = video_click_counts_df.writeStream \
-                    .foreachBatch(lambda df_batch, batch_id: process_video_clicks_batch(df_batch, batch_id, video_clicks_summary_table)) \
-                    .option("checkpointLocation", f"{args.checkpoint_location}/video_clicks_summary_windowed") \
-                    .outputMode("update") \
-                    .trigger(processingTime=args.processing_time_trigger) \
-                    .start()
-                logger.info(f"Iceberg 'video_clicks_summary' 테이블 저장 스트림 (foreachBatch) 정의 완료: {video_clicks_summary_table}")
-            else: # pragma: no cover
-                logger.warning("'event_timestamp' 컬럼이 없거나 TimestampType이 아니므로, 윈도우 집계를 건너뜁니다.")
-        except Exception as e:
-            error_message = f"비디오 클릭 집계 설정 중 오류: {str(e)}"
-            logger.error(error_message)
-            send_slack_notification(args.slack_webhook_url, error_message)
-            # 이 오류는 치명적이지 않을 수 있으므로 원본 데이터 스트림은 유지
-            logger.warning("비디오 클릭 집계 스트림은 시작되지 않았지만, 원본 데이터 스트림은 계속됩니다.")
+        #         aggregated_data_query = video_click_counts_df.writeStream \
+        #             .foreachBatch(lambda df_batch, batch_id: process_video_clicks_batch(df_batch, batch_id, video_clicks_summary_table)) \
+        #             .option("checkpointLocation", f"{args.checkpoint_location}/video_clicks_summary_windowed") \
+        #             .outputMode("update") \
+        #             .trigger(processingTime=args.processing_time_trigger) \
+        #             .start()
+        #         logger.info(f"Iceberg 'video_clicks_summary' 테이블 저장 스트림 (foreachBatch) 정의 완료: {video_clicks_summary_table}")
+        #     else: # pragma: no cover
+        #         logger.warning("'event_timestamp' 컬럼이 없거나 TimestampType이 아니므로, 윈도우 집계를 건너뜁니다.")
+        # except Exception as e:
+        #     error_message = f"비디오 클릭 집계 설정 중 오류: {str(e)}"
+        #     logger.error(error_message)
+        #     send_slack_notification(args.slack_webhook_url, error_message)
+        #     # 이 오류는 치명적이지 않을 수 있으므로 원본 데이터 스트림은 유지
+        #     logger.warning("비디오 클릭 집계 스트림은 시작되지 않았지만, 원본 데이터 스트림은 계속됩니다.")
 
-        # 스트림 실행 상태 모니터링
-        try:
-            active_streams_count = 0
-            if 'raw_data_to_iceberg_query' in locals() and raw_data_to_iceberg_query:
-                active_streams_count +=1
-            if 'aggregated_data_query' in locals() and aggregated_data_query:
-                active_streams_count +=1
-            if logger.isEnabledFor(logging.DEBUG) and 'debug_decoded_query' in locals() and debug_decoded_query: # pragma: no cover
-                active_streams_count +=1
+        # # 스트림 실행 상태 모니터링
+        # # try:
+        # #     active_streams_count = 0
+        # #     if 'raw_data_to_iceberg_query' in locals() and raw_data_to_iceberg_query:
+        # #         active_streams_count +=1
+        # #     if 'aggregated_data_query' in locals() and aggregated_data_query:
+        # #         active_streams_count +=1
+        # #     if logger.isEnabledFor(logging.DEBUG) and 'debug_decoded_query' in locals() and debug_decoded_query: # pragma: no cover
+        # #         active_streams_count +=1
             
-            logger.info(f"{active_streams_count}개의 스트림 시작됨, 종료 대기 중...")
-            spark.streams.awaitAnyTermination()
-        except Exception as e:
-            error_message = f"스트림 실행 중 오류 발생: {str(e)}"
-            logger.error(error_message)
-            send_slack_notification(args.slack_webhook_url, error_message)
-            raise
-        finally:
-            logger.info("애플리케이션 종료...")
-            # 필요하면 리소스 정리 코드 추가
+        # #     logger.info(f"{active_streams_count}개의 스트림 시작됨, 종료 대기 중...")
+        # #     spark.streams.awaitAnyTermination()
+        # # except Exception as e:
+        # #     error_message = f"스트림 실행 중 오류 발생: {str(e)}"
+        # #     logger.error(error_message)
+        # #     send_slack_notification(args.slack_webhook_url, error_message)
+        # #     raise
+        # # finally:
+        # #     logger.info("애플리케이션 종료...")
+        # #     # 필요하면 리소스 정리 코드 추가
 
     except Exception as e:
         error_message = f"애플리케이션 실행 중 예기치 않은 오류: {str(e)}"

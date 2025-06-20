@@ -9,6 +9,7 @@ import time
 from io import StringIO, BytesIO
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from faker import Faker
 
 # PyArrow import for Parquet
 import pyarrow as pa
@@ -28,9 +29,170 @@ from confluent_kafka.schema_registry.avro import AvroSerializer, AvroDeserialize
 
 from utils.slack_fail_noti import task_fail_slack_alert
 
-KAFKA_TOPIC_AVRO = 'userlog-avro-topic' # Avro 메시지를 위한 새 토픽
+kafka_cluster = '15.164.236.86:9092,3.35.5.47:9092,43.203.112.201:9092'
+SCHEMA_REGISTRY_URL = 'http://15.164.236.86:8081' # Schema Registry URL
+KAFKA_TOPIC_AVRO = 'userlog-avro-topic'         # Avro 메시지를 위한 Kafka 토픽
 
-kafka_cluster = '43.201.43.88:9092,15.165.234.219:9092,3.35.228.177:9092'
+# Avro 스키마 정의 (make_event 함수 구조 기반)
+AVRO_SCHEMA_STRING = """
+{
+  "type": "record",
+  "name": "UserEvent",
+  "fields": [
+    {"name": "videoId", "type": ["null", "string"]},
+    {"name": "title", "type": ["null", "string"]},
+    {"name": "userId", "type": ["null","string"]},
+    {"name": "timestamp", "type": ["null", "long"]},
+    {"name": "eventType", "type": ["null", "string"]},
+    {"name": "page", "type": ["null", "string"]},
+    {"name": "liked", "type": ["null", "boolean"]},
+    {"name": "review", "type": ["null", "string"]},
+    {"name": "rating", "type": ["null", "int"]},
+    {"name": "genre", "type": ["null", {"type": "array", "items": "string"}], "default": null},
+    {"name": "recMovieList", "type": ["null", "string"], "default": null}
+  ]
+}
+"""
+
+def delivery_report(err, msg):
+    """ Called once for each message produced to indicate delivery result.
+        Triggered by poll() or flush(). """
+    if err is not None:
+        print(f"❌ Message delivery failed: {err}")
+    else:
+        # Log a small percentage of successful deliveries to avoid excessive logging
+        if random.random() < 0.0001: # Log 0.01% of successful messages
+             print(f"✅ Message delivered to {msg.topic()} [{msg.partition()}] @ offset {msg.offset()}")
+
+
+def generate_event_avro(**kwargs):
+    fake = Faker()
+
+    producer_config = {
+        'bootstrap.servers': kafka_cluster,
+        'schema.registry.url': SCHEMA_REGISTRY_URL,
+        'retries': 10,
+        'linger.ms': 200,
+    }
+
+    avro_producer = AvroProducer(
+        producer_config,
+        default_value_schema=AVRO_SCHEMA_STRING
+    )
+
+    mongo_contents_data = []
+    if PYMONGO_AVAILABLE:
+        try:
+            # MongoDB 연결 정보 - 실제 환경에 맞게 수정하세요.
+            # 예: client = MongoClient('mongodb://user:pass@host:port/admin')
+            client = MongoClient('mongodb+srv://user:goorm0508@goorm-mongodb.svz66jf.mongodb.net/?retryWrites=true&w=majority&appName=goorm-mongoDB') # 로컬 MongoDB 예시
+            client.admin.command('ping') # 연결 테스트
+            db = client['content-db']
+            contents_collection = db['contents']
+            # 'title'과 'videoId' 필드만 가져옵니다. _id는 제외합니다.
+            # 실제 MongoDB의 필드명이 'videoId'가 아니라면 해당 필드명으로 수정해야 합니다.
+            mongo_contents_data = list(contents_collection.find({}, {"_id": 0, "title": 1, "videoId": 1, "genre": 1}))
+            client.close()
+            if mongo_contents_data:
+                print(f"✅ Successfully fetched {len(mongo_contents_data)} items from MongoDB 'contents' collection.")
+            else:
+                print("ℹ️ No data fetched from MongoDB 'contents' collection or collection is empty.")
+        except ConnectionFailure:
+            print("❌ Failed to connect to MongoDB. Will proceed without MongoDB data.")
+        except Exception as e:
+            print(f"❌ Error fetching data from MongoDB: {e}. Will proceed without MongoDB data.")
+
+    num_events = 1_00_000  # 필요한 양으로 조절 가능
+    # num_events = 1000 # 테스트용
+
+    event_types = ["like_click", "content_click", "review_write", "rating_submit", "paly_start", "paly_stop", "content_recom_click"]
+    pages = ["content_detail", "main", "content_paly"]
+
+    def make_event_payload(): # 함수명 변경하여 명확화
+        # Avro 스키마에 정의된 모든 필드를 초기에 None으로 설정 (userId, timestamp 등은 아래에서 덮어쓰여짐)
+        event = {
+            "videoId": None,
+            "title": None,
+            "userId": None, # Placeholder, will be overwritten
+            "timestamp": None, # Placeholder, will be overwritten
+            "eventType": None, # Placeholder, will be overwritten
+            "page": None, # Placeholder, will be overwritten
+            "liked": None,
+            "review": None,
+            "rating": None,
+            "genre": None,
+            "recMovieList": None
+        }
+        if mongo_contents_data:
+            selected_content = random.choice(mongo_contents_data)
+            event["videoId"] = selected_content.get("videoId")
+            event["title"] = selected_content.get("title")
+            event["genre"] = selected_content.get("genre")
+
+        # videoId와 title은 mongo_contents_data가 없으면 이미 None으로 설정됨
+       # ISO 문자열 대신 Unix 타임스탬프(밀리초)로 설정
+        fake_datetime = fake.date_time_between(start_date="-1d", end_date="now")
+        unix_timestamp = int(fake_datetime.timestamp() * 1000)  # 초를 밀리초로 변환
+
+        event.update({ # 필수 필드 및 기본값 없는 필드 업데이트
+                "userId": fake.uuid4(),
+                "timestamp": unix_timestamp,  # 문자열에서 정수로 변경
+                "eventType": random.choice(event_types)
+            })
+
+        if event["eventType"] == "like_click":
+            event["page"] = "content_detail"
+            event["liked"] = random.choice([True, False])
+        elif event["eventType"] == "review_write":
+            event["page"] = "content_detail"
+            event["review"] = fake.sentence()
+        elif event["eventType"] == "rating_submit":
+            event["page"] = "content_detail"
+            event["rating"] = random.randint(1, 5)
+        elif event["eventType"] == "content_click": # 'else' 대신 명시적으로 'content_click' 처리
+            event["page"] = "content_detail"
+        elif event["eventType"] == "content_recom_click":
+            event["page"] = "content_detail"
+            event["recMovieList"] = fake.sentence()
+        elif event["eventType"] == "paly_start":
+            event["page"] = "content_paly"
+        elif event["eventType"] == "paly_stop":
+            event["page"] = "content_paly"
+
+        # 다른 eventType의 경우, 해당 특정 필드들은 None으로 유지됨
+        return event
+
+    print(f"🚀 Producing {num_events:,} dummy Avro messages to Kafka topic `{KAFKA_TOPIC_AVRO}`")
+
+    start_time = time.time()
+    produced_count = 0
+    for i in range(num_events):
+        msg_payload = make_event_payload()
+        try:
+            # AvroProducer는 value에 dict를 전달하면 스키마에 따라 직렬화
+            avro_producer.produce(topic=KAFKA_TOPIC_AVRO, value=msg_payload, callback=delivery_report)
+            produced_count += 1
+        except BufferError:
+            print("Local producer queue is full... flushing pending messages.")
+            avro_producer.flush() # 버퍼가 꽉 차면 flush
+            # 재시도
+            avro_producer.produce(topic=KAFKA_TOPIC_AVRO, value=msg_payload, callback=delivery_report)
+            produced_count += 1
+        except Exception as e:
+            print(f"❌ Error producing message: {e}")
+
+        if i % 10000 == 0:
+            avro_producer.poll(0)
+
+    print(f"⏳ Flushing remaining messages ({len(avro_producer)} messages in queue)...")
+    remaining_messages = avro_producer.flush(timeout=30)
+    if remaining_messages > 0:
+        print(f"⚠️ {remaining_messages} messages still in queue after flush timeout.")
+    
+    end_time = time.time()
+    print(f"✅ Sent {produced_count:,} Avro events in {end_time - start_time:.2f} seconds to topic '{KAFKA_TOPIC_AVRO}'")
+    print("✅ Dummy Avro events generation process finished.")
+
 
 
 def connect_minio():
@@ -217,31 +379,29 @@ def kafka_consumer(**context):
 def check_kafka_broker_health():
     brokers = kafka_cluster.split(',') # Split the comma-separated string into a list of brokers
     alive_count = 0
-    admin_client = None # finally 블록에서 사용하기 위해 초기화
+    # admin_client instance will be created inside the loop for each broker check
+    MIN_ALIVE_BROKERS = 2
 
     for broker_url in brokers:
+        # admin_client_instance = None # Not strictly needed as ConfluentAdminClient doesn't have explicit close
         try:
-            admin_client = ConfluentAdminClient( # ConfluentAdminClient 사용
-                bootstrap_servers=broker_url,
-                client_id='kafka-health-check',
-                request_timeout_ms=5000
-            )
-            topics = admin_client.list_topics() # Removed timeout_ms argument
-            print(f"✅ Broker {broker_url} is alive. Found {len(topics)} topics.")
+            conf = {
+                'bootstrap.servers': broker_url, # 개별 브로커 URL로 설정
+                'client.id': f'airflow-health-check-{broker_url.replace(":", "-").replace(".", "_")}', # 유니크한 client.id
+                'socket.timeout.ms': 5000,      # 소켓 연결 타임아웃 (ms)
+            }
+            admin_client = ConfluentAdminClient(conf)
+            # list_topics 호출 시 타임아웃(초 단위) 설정
+            cluster_metadata = admin_client.list_topics(timeout=5.0)
+            print(f"✅ Broker {broker_url} is alive. Cluster ID: {cluster_metadata.cluster_id}. Found {len(cluster_metadata.topics)} topics.")
             alive_count += 1
         except ConfluentKafkaError as e: # ConfluentKafkaError 사용
             print(f"❌ Broker {broker_url} health check failed: {e}")
         except Exception as e:
             print(f"❌ An unexpected error occurred while checking broker {broker_url}: {e}")
-        finally:
-            if admin_client:
-                try:
-                    admin_client.close()
-                except Exception as e_close:
-                    print(f"⚠️ Error closing AdminClient for {broker_url}: {e_close}")
-                admin_client = None # 다음 루프를 위해 초기화
+        # finally: ConfluentAdminClient는 명시적인 close() 메서드가 필요하지 않습니다.
+            # 리소스는 내부적으로 관리됩니다.
 
-    MIN_ALIVE_BROKERS = 2
     if alive_count < MIN_ALIVE_BROKERS:
         raise Exception(f"Kafka cluster health check failed: Only {alive_count} out of {len(brokers)} brokers are alive. Required: {MIN_ALIVE_BROKERS}.")
     else:
@@ -266,6 +426,12 @@ with DAG(
     schedule_interval='*/30 * * * *', # 30분 간격으로 실행
     tags=['userlog', 'avro', 'kafka', 'parquet', 'minio', 'iceberg'] # 태그 업데이트
 ) as dag:
+    
+    produce_avro_data = PythonOperator(
+        task_id='produce_avro_data',
+        python_callable=generate_event_avro,
+    )
+    
 
     check_kafka_brokers_health = PythonOperator(
         task_id='check_kafka_broker_health',
@@ -277,34 +443,36 @@ with DAG(
         python_callable=kafka_consumer,
     )
 
-    check_minio_file_upload = S3KeySensor(
-        task_id='check_minio_file_upload',
-        bucket_name='userlog-data', 
-        bucket_key="{{ ti.xcom_pull(task_ids='kafka_consumer_avro_to_parquet_minio', key='s3_object_key') }}", # XCom 키 및 태스크 ID 수정
-        aws_conn_id='minio',
-        poke_interval=30, 
-        timeout=600, 
-        soft_fail=False, # Parquet 파일이 반드시 있어야 Iceberg 작업이 의미 있으므로 False로 변경 고려
-    )
+    # check_minio_file_upload = S3KeySensor(
+    #     task_id='check_minio_file_upload',
+    #     bucket_name='userlog-data', 
+    #     bucket_key="{{ ti.xcom_pull(task_ids='kafka_consumer_avro_to_parquet_minio', key='s3_object_key') }}", # XCom 키 및 태스크 ID 수정
+    #     aws_conn_id='minio',
+    #     poke_interval=30, 
+    #     timeout=600, 
+    #     soft_fail=False, # Parquet 파일이 반드시 있어야 Iceberg 작업이 의미 있으므로 False로 변경 고려
+    # )
 
     # Spark 작업: MinIO의 Parquet 파일을 읽어 Iceberg 테이블을 생성/업데이트합니다.
     # 실제 Spark 애플리케이션 ('/opt/spark/data/manage_iceberg_table.py')은 이 목적에 맞게 작성되어야 합니다.
-    manage_iceberg_table = SparkSubmitOperator(
-        task_id='manage_iceberg_table_from_parquet', # 태스크 ID 및 역할 변경
-        application="/opt/spark/data/userlog_iceberg_spark.py", # Iceberg 처리용 Spark 앱 경로 (예시)
-        conn_id='spark', 
-        application_args=[
-            "--source_parquet_path", f"s3a://userlog-data/{{{{ ti.xcom_pull(task_ids='kafka_consumer_avro_to_parquet_minio', key='s3_object_key') }}}}",
-            "--iceberg_catalog_name", "minio_catalog",
-            "--iceberg_db_name", "userlog_db",
-            "--iceberg_table_name", "user_activity_logs", # 대상 Iceberg 테이블 이름 (예시, 필요시 avro_user_activity_logs 등으로 변경)
-            "--s3_endpoint", "http://54.180.166.228:9000", # MinIO 엔드포인트
-            "--s3_access_key", "minioadmin",       # MinIO Access Key
-            "--s3_secret_key", "minioadmin"        # MinIO Secret Key
-        ],
-        # Iceberg 사용을 위해 Spark에 필요한 JAR들을 포함해야 합니다.
-        # 예: iceberg-spark-runtime, aws-java-sdk-bundle 등
-        jars="/opt/spark/jars/hadoop-aws-3.3.1.jar,/opt/spark/jars/aws-java-sdk-bundle-1.11.901.jar,/opt/spark/jars/iceberg-spark-runtime-3.4_2.12-1.4.2.jar", # 실제 Iceberg JAR 경로로 수정
-    )
+    # manage_iceberg_table = SparkSubmitOperator(
+    #     task_id='manage_iceberg_table_from_parquet', # 태스크 ID 및 역할 변경
+    #     application="/opt/spark/data/userlog_iceberg_spark.py", # Iceberg 처리용 Spark 앱 경로 (예시)
+    #     conn_id='spark', 
+    #     application_args=[
+    #         "--source_parquet_path", f"s3a://userlog-data/{{{{ ti.xcom_pull(task_ids='kafka_consumer_avro_to_parquet_minio', key='s3_object_key') }}}}",
+    #         "--iceberg_catalog_name", "minio_catalog",
+    #         "--iceberg_db_name", "userlog_db",
+    #         "--iceberg_table_name", "user_activity_logs", # 대상 Iceberg 테이블 이름 (예시, 필요시 avro_user_activity_logs 등으로 변경)
+    #         "--s3_endpoint", "http://54.180.166.228:9000", # MinIO 엔드포인트
+    #         "--s3_access_key", "minioadmin",       # MinIO Access Key
+    #         "--s3_secret_key", "minioadmin"        # MinIO Secret Key
+    #     ],
+    #     # Iceberg 사용을 위해 Spark에 필요한 JAR들을 포함해야 합니다.
+    #     # 예: iceberg-spark-runtime, aws-java-sdk-bundle 등
+    #     jars="/opt/spark/jars/hadoop-aws-3.3.1.jar,/opt/spark/jars/aws-java-sdk-bundle-1.11.901.jar,/opt/spark/jars/iceberg-spark-runtime-3.4_2.12-1.4.2.jar", # 실제 Iceberg JAR 경로로 수정
+    # )
 
-    check_kafka_brokers_health >> consume_avro_data_to_minio >> check_minio_file_upload >> manage_iceberg_table
+    check_kafka_brokers_health >> consume_avro_data_to_minio 
+    # >> check_minio_file_upload 
+    # >> manage_iceberg_table

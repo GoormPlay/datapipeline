@@ -23,8 +23,8 @@ except ImportError:
 
 from utils.slack_fail_noti import task_fail_slack_alert
 
-kafka_cluster = '43.203.143.250:9092,3.38.134.186:9092,43.203.175.250:9092'
-SCHEMA_REGISTRY_URL = 'http://43.203.143.250:8081' # Schema Registry URL
+kafka_cluster = '15.164.236.86:9092,3.35.5.47:9092,43.203.112.201:9092'
+SCHEMA_REGISTRY_URL = 'http://15.164.236.86:8081' # Schema Registry URL
 KAFKA_TOPIC_AVRO = 'userlog-avro-topic'         # Avro 메시지를 위한 Kafka 토픽
 
 # Avro 스키마 정의 (make_event 함수 구조 기반)
@@ -42,7 +42,8 @@ AVRO_SCHEMA_STRING = """
     {"name": "liked", "type": ["null", "boolean"]},
     {"name": "review", "type": ["null", "string"]},
     {"name": "rating", "type": ["null", "int"]},
-    {"name": "contentCategory", "type": ["null", {"type": "array", "items": "string"}], "default": null}
+    {"name": "genre", "type": ["null", {"type": "array", "items": "string"}], "default": null},
+    {"name": "recMovieList", "type": ["null", "string"], "default": null}
   ]
 }
 """
@@ -84,7 +85,7 @@ def generate_event_avro(**kwargs):
             contents_collection = db['contents']
             # 'title'과 'videoId' 필드만 가져옵니다. _id는 제외합니다.
             # 실제 MongoDB의 필드명이 'videoId'가 아니라면 해당 필드명으로 수정해야 합니다.
-            mongo_contents_data = list(contents_collection.find({}, {"_id": 0, "title": 1, "videoId": 1}))
+            mongo_contents_data = list(contents_collection.find({}, {"_id": 0, "title": 1, "videoId": 1, "genre": 1}))
             client.close()
             if mongo_contents_data:
                 print(f"✅ Successfully fetched {len(mongo_contents_data)} items from MongoDB 'contents' collection.")
@@ -98,8 +99,7 @@ def generate_event_avro(**kwargs):
     num_events = 1_00_000  # 필요한 양으로 조절 가능
     # num_events = 1000 # 테스트용
 
-    event_types = ["like_click", "content_click", "review_write", "rating_submit"]
-    pages = ["content_detail", "main"]
+    event_types = ["like_click", "content_click", "review_write", "rating_submit", "paly_start", "paly_stop", "content_recom_click"]
 
     def make_event_payload(): # 함수명 변경하여 명확화
         # Avro 스키마에 정의된 모든 필드를 초기에 None으로 설정 (userId, timestamp 등은 아래에서 덮어쓰여짐)
@@ -113,32 +113,46 @@ def generate_event_avro(**kwargs):
             "liked": None,
             "review": None,
             "rating": None,
-            "contentCategory": None
+            "genre": None,
+            "recMovieList": None
         }
         if mongo_contents_data:
             selected_content = random.choice(mongo_contents_data)
             event["videoId"] = selected_content.get("videoId")
             event["title"] = selected_content.get("title")
-        # videoId와 title은 mongo_contents_data가 없으면 이미 None으로 설정됨
-       # ISO 문자열 대신 Unix 타임스탬프(밀리초)로 설정
-            fake_datetime = fake.date_time_between(start_date="-1d", end_date="now")
-            unix_timestamp = int(fake_datetime.timestamp() * 1000)  # 초를 밀리초로 변환
-    
-            event.update({ # 필수 필드 및 기본값 없는 필드 업데이트
-                "userId": fake.uuid4(),
-                "timestamp": unix_timestamp,  # 문자열에서 정수로 변경
-                "eventType": random.choice(event_types),
-                "page": random.choice(pages),
-            })
+            event["genre"] = selected_content.get("genre")
+        # else: # 이 else 블록을 제거하고 아래 로직을 항상 실행하도록 변경
+        # videoId와 title은 mongo_contents_data가 없으면 이미 None으로 설정됨 (위에서 처리)
+
+        # userId, timestamp, eventType은 MongoDB 데이터 유무와 관계없이 항상 생성
+        fake_datetime = fake.date_time_between(start_date="-1d", end_date="now")
+        unix_timestamp = int(fake_datetime.timestamp() * 1000)  # 초를 밀리초로 변환
+
+        event.update({ # 필수 필드 및 기본값 없는 필드 업데이트
+            "userId": fake.uuid4(),
+            "timestamp": unix_timestamp,
+            "eventType": random.choice(event_types)
+        })
 
         if event["eventType"] == "like_click":
+            event["page"] = "content_detail"
             event["liked"] = random.choice([True, False])
         elif event["eventType"] == "review_write":
+            event["page"] = "content_detail"
             event["review"] = fake.sentence()
         elif event["eventType"] == "rating_submit":
+            event["page"] = "content_detail"
             event["rating"] = random.randint(1, 5)
         elif event["eventType"] == "content_click": # 'else' 대신 명시적으로 'content_click' 처리
-            event["contentCategory"] = [fake.word() for _ in range(random.randint(1, 3))]
+            event["page"] = "content_detail"
+        elif event["eventType"] == "content_recom_click":
+            event["page"] = "content_detail"
+            event["recMovieList"] = fake.sentence()
+        elif event["eventType"] == "paly_start":
+            event["page"] = "content_paly"
+        elif event["eventType"] == "paly_stop":
+            event["page"] = "content_paly"
+
         # 다른 eventType의 경우, 해당 특정 필드들은 None으로 유지됨
         return event
 
