@@ -71,6 +71,7 @@ def build_spark_submit_command(config, job_script):
         "--s3_endpoint", config['s3']['endpoint'],
         "--s3_access_key", config['s3']['access_key'],
         "--s3_secret_key", config['s3']['secret_key'],
+        "--s3_region", config['s3']['s3_region'],
         "--processing_time_trigger", config['streaming']['processing_time_trigger']
     ])
 

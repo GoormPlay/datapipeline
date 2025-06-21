@@ -105,7 +105,7 @@ def send_slack_notification(webhook_url, message):
 
 ### Iceberg 처리 함수 ###
 
-def process_video_clicks_batch(batch_df, batch_id, video_clicks_summary_table_name):
+def upsert_video_clicks_batch(batch_df, batch_id, video_clicks_summary_table_name):
     """
     각 마이크로배치를 Iceberg 테이블에 upsert 처리하는 함수
     """
@@ -165,6 +165,7 @@ def main():
         parser.add_argument("--s3_endpoint", required=True, help='S3 엔드포인트')
         parser.add_argument("--s3_access_key", required=True, help='S3 액세스 키')
         parser.add_argument("--s3_secret_key", required=True, help='S3 시크릿 키')
+        parser.add_argument("--s3_region", required=True, help='S3 리전')
         parser.add_argument("--processing_time_trigger", default="30 seconds", help='처리 시간 트리거 (예: "30 seconds")')
         parser.add_argument("--schema_version_s3_bucket", required=True, help='스키마 버전 저장할 S3 버킷')
         parser.add_argument("--schema_version_s3_key", required=True, help='스키마 버전 저장할 S3 키')
@@ -214,12 +215,12 @@ def main():
         # 스키마 변경 감지 및 알림
         if last_schema_hash != current_schema_hash:
             msg = f"""
-✨ *Avro 스키마 변경 감지!*
-*Subject:* `{args.schema_subject}`
-*이전 해시:* `{last_schema_hash or '없음'}`
-*신규 해시:* `{current_schema_hash}`
-*버전:* `{current_version}`
-"""
+                ✨ *Avro 스키마 변경 감지!*
+                *Subject:* `{args.schema_subject}`
+                *이전 해시:* `{last_schema_hash or '없음'}`
+                *신규 해시:* `{current_schema_hash}`
+                *버전:* `{current_version}`
+                """
             logger.info("Avro 스키마 변경 감지됨!")
             send_slack_notification(args.slack_webhook_url, msg)
             save_schema_hash_to_s3(s3_client, args.schema_version_s3_bucket, hash_s3_key, current_schema_hash)
@@ -228,19 +229,25 @@ def main():
         else:
             logger.info("Avro 스키마 변경 없음")
 
-        # SparkSession 설정
+        # SparkSession 설정 - iceberge.type 명시 에러
         spark = SparkSession.builder \
-            .appName("KafkaToIcebergETL") \
-            .config(f"spark.sql.catalog.{args.iceberg_catalog_name}", "org.apache.iceberg.spark.SparkCatalog") \
-            .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.type", "hadoop") \
-            .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.warehouse", args.iceberg_warehouse_path) \
-            .config("spark.hadoop.fs.s3a.endpoint", args.s3_endpoint) \
-            .config("spark.hadoop.fs.s3a.access.key", args.s3_access_key) \
-            .config("spark.hadoop.fs.s3a.secret.key", args.s3_secret_key) \
-            .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-            .config("spark.hadoop.fs.s3a.aws.credentials.provider", "") \
-            .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-            .getOrCreate()
+        .appName("KafkaToIcebergETL") \
+        .config("spark.driver.bindAddress", "127.0.0.1") \
+        .config("spark.driver.host", "127.0.0.1") \
+        .config(f"spark.sql.catalog.{args.iceberg_catalog_name}", "org.apache.iceberg.spark.SparkCatalog") \
+        .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.type", "hadoop") \
+        .config(f"spark.sql.catalog.iceberg.type", "hadoop") \
+        .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.warehouse", args.iceberg_warehouse_path) \
+        .config("spark.hadoop.fs.s3a.endpoint", args.s3_endpoint) \
+        .config("spark.hadoop.fs.s3a.access.key", args.s3_access_key) \
+        .config("spark.hadoop.fs.s3a.secret.key", args.s3_secret_key) \
+        .config("spark.hadoop.fs.s3a.region", args.s3_region) \
+        .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+        .getOrCreate()
+            
 
         logger.info("SparkSession 생성 완료")
 
@@ -277,29 +284,18 @@ def main():
 
         logger.info(f"Kafka 스트리밍 리더 설정 완료 (토픽: {args.kafka_topic})")
 
-         # #  get magic byte value
-        df = df.withColumn("magicByte", func.expr("substring(value, 1, 1)"))
-
-        #  get schema id from value
-        df = df.withColumn("valueSchemaId", func.expr("substring(value, 2, 4)"))
-
-        # remove first 5 bytes from value
-        df = df.withColumn("fixedValue", func.expr("substring(value, 6, length(value)-5)"))
-
-        # creating a new df with magicBytes, valueSchemaId & fixedValue
-        value_df = df.select("magicByte", "valueSchemaId", "fixedValue")
         # Avro 디코딩 (Confluent 와이어 포맷 처리)
-        # current_schema_str은 스키마 변경 감지 및 S3 저장을 위해 사용되며,
-        # from_avro는 schema.registry.url을 통해 스키마를 가져옵니다.
-        latest_version, _ = fetch_avro_schema(args.schema_registry_url, args.schema_subject)
+        # Kafka 'value' 컬럼에서 5바이트 헤더(Magic Byte + Schema ID)를 제거합니다.
+        # from_avro 함수에 스키마 문자열을 직접 제공할 때는 순수 Avro 바이너리 데이터만 전달해야 합니다.
+        fixed_value_df = df.withColumn("fixedValue", func.expr("substring(value, 6, length(value)-5)"))
+
         try:
             fromAvroOptions = {"mode":"PERMISSIVE"}
-            from_avro_df = value_df.select(
-                from_avro(col("fixedValue"), latest_version, fromAvroOptions).alias("data")
+            from_avro_df = fixed_value_df.select(
+                from_avro(col("fixedValue"), current_schema_str, fromAvroOptions).alias("data")
             )
 
             decoded_df = from_avro_df.select("data.*")
-            decoded_df.printSchema()
             
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("Schema of decoded_df (after from_avro and select data.*):")
@@ -364,6 +360,8 @@ def main():
         for field in user_logs_iceberg_schema.fields:
             columns_ddl_parts.append(f"`{field.name}` {field.dataType.simpleString()}")
         columns_ddl = ", ".join(columns_ddl_parts)
+
+        ######################################################################3
         
         create_table_sql = f"CREATE TABLE IF NOT EXISTS {raw_data_table} ({columns_ddl}) USING iceberg"
         # 필요시 파티셔닝 추가: e.g., PARTITIONED BY (days(event_timestamp))
@@ -399,79 +397,58 @@ def main():
                 .option("checkpointLocation", f"{args.checkpoint_location}/raw_data") \
                 .toTable(raw_data_table)
             logger.info(f"원본 데이터 Iceberg 테이블 스트림 시작됨: {raw_data_table}")
-            raw_data_to_iceberg_query.show()
+    
         except Exception as e:
             error_message = f"원본 데이터 Iceberg 저장 설정 중 오류: {str(e)}"
             logger.error(error_message)
             send_slack_notification(args.slack_webhook_url, error_message)
             raise
 
-        # # 2. 비디오 클릭 집계
-        # try:
-        #     aggregated_data_query = None # 초기화
-        #     # 집계는 event_timestamp 컬럼이 유효할 때만 수행
-        #     if "event_timestamp" in df_with_event_timestamp.columns and \
-        #        isinstance(df_with_event_timestamp.schema["event_timestamp"].dataType, TimestampType):
-        #         logger.info("'event_timestamp'을 사용하여 윈도우 집계를 수행합니다.")
+        # 2. 비디오 클릭 집계
+        try:
+            aggregated_data_query = None # 초기화
+            # 집계는 event_timestamp 컬럼이 유효할 때만 수행
+            if "event_timestamp" in df_with_event_timestamp.columns and \
+               isinstance(df_with_event_timestamp.schema["event_timestamp"].dataType, TimestampType):
+                logger.info("'event_timestamp'을 사용하여 윈도우 집계를 수행합니다.")
                 
-        #         df_for_aggregation = df_with_event_timestamp.select("videoId", "title", "eventType", "event_timestamp")
-        #         video_click_counts_df = df_for_aggregation \
-        #         .filter(col("eventType") == "content_click") \
-        #         .withWatermark("event_timestamp", "5 minutes") \
-        #         .groupBy(
-        #             window(col("event_timestamp"), args.processing_time_trigger).alias("time_window"),
-        #             col("videoId"),
-        #             col("title")
-        #         ) \
-        #         .agg(count("*").alias("click_count")) \
-        #         .select(
-        #             col("time_window.start").alias("window_start"),
-        #             col("time_window.end").alias("window_end"),
-        #             col("videoId"),
-        #             col("title"),
-        #             col("click_count")
-        #         )
+                df_for_aggregation = df_with_event_timestamp.select("videoId", "title", "eventType", "event_timestamp")
+                video_click_counts_df = df_for_aggregation \
+                .filter(col("eventType") == "content_click") \
+                .withWatermark("event_timestamp", "5 minutes") \
+                .groupBy(
+                    window(col("event_timestamp"), args.processing_time_trigger).alias("time_window"),
+                    col("videoId"),
+                    col("title")
+                ) \
+                .agg(count("*").alias("click_count")) \
+                .select(
+                    col("time_window.start").alias("window_start"),
+                    col("time_window.end").alias("window_end"),
+                    col("videoId"),
+                    col("title"),
+                    col("click_count")
+                )
                 
-        #         if logger.isEnabledFor(logging.DEBUG): # pragma: no cover
-        #             logger.debug("Schema of video_click_counts_df (for aggregation):")
-        #             video_click_counts_df.printSchema()
+                if logger.isEnabledFor(logging.DEBUG): # pragma: no cover
+                    logger.debug("Schema of video_click_counts_df (for aggregation):")
+                    video_click_counts_df.printSchema()
 
-        #         aggregated_data_query = video_click_counts_df.writeStream \
-        #             .foreachBatch(lambda df_batch, batch_id: process_video_clicks_batch(df_batch, batch_id, video_clicks_summary_table)) \
-        #             .option("checkpointLocation", f"{args.checkpoint_location}/video_clicks_summary_windowed") \
-        #             .outputMode("update") \
-        #             .trigger(processingTime=args.processing_time_trigger) \
-        #             .start()
-        #         logger.info(f"Iceberg 'video_clicks_summary' 테이블 저장 스트림 (foreachBatch) 정의 완료: {video_clicks_summary_table}")
-        #     else: # pragma: no cover
-        #         logger.warning("'event_timestamp' 컬럼이 없거나 TimestampType이 아니므로, 윈도우 집계를 건너뜁니다.")
-        # except Exception as e:
-        #     error_message = f"비디오 클릭 집계 설정 중 오류: {str(e)}"
-        #     logger.error(error_message)
-        #     send_slack_notification(args.slack_webhook_url, error_message)
-        #     # 이 오류는 치명적이지 않을 수 있으므로 원본 데이터 스트림은 유지
-        #     logger.warning("비디오 클릭 집계 스트림은 시작되지 않았지만, 원본 데이터 스트림은 계속됩니다.")
-
-        # # 스트림 실행 상태 모니터링
-        # # try:
-        # #     active_streams_count = 0
-        # #     if 'raw_data_to_iceberg_query' in locals() and raw_data_to_iceberg_query:
-        # #         active_streams_count +=1
-        # #     if 'aggregated_data_query' in locals() and aggregated_data_query:
-        # #         active_streams_count +=1
-        # #     if logger.isEnabledFor(logging.DEBUG) and 'debug_decoded_query' in locals() and debug_decoded_query: # pragma: no cover
-        # #         active_streams_count +=1
-            
-        # #     logger.info(f"{active_streams_count}개의 스트림 시작됨, 종료 대기 중...")
-        # #     spark.streams.awaitAnyTermination()
-        # # except Exception as e:
-        # #     error_message = f"스트림 실행 중 오류 발생: {str(e)}"
-        # #     logger.error(error_message)
-        # #     send_slack_notification(args.slack_webhook_url, error_message)
-        # #     raise
-        # # finally:
-        # #     logger.info("애플리케이션 종료...")
-        # #     # 필요하면 리소스 정리 코드 추가
+                aggregated_data_query = video_click_counts_df.writeStream \
+                    .foreachBatch(lambda df_batch, batch_id: upsert_video_clicks_batch(df_batch, batch_id, video_clicks_summary_table)) \
+                    .option("checkpointLocation", f"{args.checkpoint_location}/video_clicks_summary_windowed") \
+                    .outputMode("update") \
+                    .trigger(processingTime=args.processing_time_trigger) \
+                    .start()
+                logger.info(f"Iceberg 'video_clicks_summary' 테이블 저장 스트림 (foreachBatch) 정의 완료: {video_clicks_summary_table}")
+            else: # pragma: no cover
+                logger.warning("'event_timestamp' 컬럼이 없거나 TimestampType이 아니므로, 윈도우 집계를 건너뜁니다.")
+        except Exception as e:
+            error_message = f"비디오 클릭 집계 설정 중 오류: {str(e)}"
+            logger.error(error_message)
+            send_slack_notification(args.slack_webhook_url, error_message)
+            # 이 오류는 치명적이지 않을 수 있으므로 원본 데이터 스트림은 유지
+            logger.warning("비디오 클릭 집계 스트림은 시작되지 않았지만, 원본 데이터 스트림은 계속됩니다.")
 
     except Exception as e:
         error_message = f"애플리케이션 실행 중 예기치 않은 오류: {str(e)}"

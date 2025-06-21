@@ -33,6 +33,7 @@ s3:
   endpoint: "http://54.180.166.228:9000"
   access_key: "${S3_ACCESS_KEY}"
   secret_key: "${S3_SECRET_KEY}"
+  s3_region: "ap-northeast-2"
   path_style_access: true
   connection_ssl_enabled: false
 
