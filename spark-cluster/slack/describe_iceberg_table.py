@@ -22,7 +22,7 @@ ICEBERG_TABLE_NAME = "user_logs"           # 예: "user_activity_logs" (스키�
 # spark.packages 설정을 참고할 수 있습니다.
 # 만약 config.yaml에 org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.2 와 같은 형식으로 있다면 그대로 사용합니다.
 # hadoop-aws 패키지도 필요합니다. config.yaml과 일치하도록 수정합니다.
-ICEBERG_PACKAGES = "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.2,org.apache.hadoop:hadoop-aws:3.3.2,com.amazonaws:aws-java-sdk-bundle:1.12.262"
+ICEBERG_PACKAGES = "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.3.1,org.apache.hadoop:hadoop-aws:3.3.2,com.amazonaws:aws-java-sdk-bundle:1.12.262,"
 # 참고: hadoop-aws 버전(3.3.2)과 호환되는 aws sdk bundle 버전(1.12.262)을 사용합니다.
 # Spark 3.3.x 이하는 com.amazonaws:aws-java-sdk-bundle:1.12.x 대를 사용 할 수 있습니다.
 
@@ -42,6 +42,7 @@ def main():
         .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY) \
         .config("spark.hadoop.fs.s3a.path.style.access", "true") \
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
         .getOrCreate()
 
@@ -50,12 +51,34 @@ def main():
     table_identifier = f"{ICEBERG_CATALOG_NAME}.{ICEBERG_DB_NAME}.{ICEBERG_TABLE_NAME}"
 
     try:
-        print(f"\n테이블 스키마 조회 중: {table_identifier}")
-        spark.sql(f"DESCRIBE TABLE {table_identifier}").show(truncate=False)
-
-        print(f"\n테이블 상세 정보 (FORMATTED) 조회 중: {table_identifier}")
-        # FORMATTED는 더 많은 정보를 보여주므로, row 수를 늘려서 확인 (기본은 20줄)
-        spark.sql(f"DESCRIBE FORMATTED {table_identifier}").show(n=100, truncate=False)
+        # 데이터베이스 목록 확인
+        print("\n사용 가능한 데이터베이스 목록:")
+        spark.sql("SHOW DATABASES").show(truncate=False)
+        
+        # 테이블 목록 확인
+        print(f"\n{ICEBERG_CATALOG_NAME}.{ICEBERG_DB_NAME} 데이터베이스의 테이블 목록:")
+        spark.sql(f"SHOW TABLES IN {ICEBERG_CATALOG_NAME}.{ICEBERG_DB_NAME}").show(truncate=False)
+        
+        # 테이블이 존재하는지 확인
+        tables_df = spark.sql(f"SHOW TABLES IN {ICEBERG_CATALOG_NAME}.{ICEBERG_DB_NAME}")
+        table_exists = False
+        
+        if not tables_df.isEmpty():
+            table_names = [row['tableName'] for row in tables_df.collect()]
+            table_exists = ICEBERG_TABLE_NAME in table_names
+            
+        if table_exists:
+            print(f"\n테이블 스키마 조회 중: {table_identifier}")
+            # spark.sql()를 사용하는 대신 Spark DataFrame API 사용
+            table_df = spark.table(table_identifier)
+            print("테이블 스키마:")
+            table_df.printSchema()
+            
+            print("\n테이블 데이터 샘플 (최대 5개 행):")
+            table_df.show(5, truncate=False)
+            
+            print("\n테이블 통계 정보:")
+            table_df.describe().show()
 
     except Exception as e:
         print(f"오류 발생: {e}")
@@ -65,7 +88,10 @@ def main():
         print(f"  3. Iceberg 카탈로그 이름, 웨어하우스 경로, DB 이름, 테이블 이름이 정확한가요?")
         print(f"  4. 지정된 테이블 '{table_identifier}'이 실제로 MinIO에 존재하나요?")
         print(f"  5. `ICEBERG_PACKAGES`에 지정된 Spark, Iceberg, Hadoop-AWS 버전이 호환되나요?")
-
+        print("\n디버깅 정보:")
+        print("  - Spark 버전:", spark.version)
+        print("  - Iceberg 설정:", spark.conf.get(f"spark.sql.catalog.{ICEBERG_CATALOG_NAME}"))
+        print("  - S3 엔드포인트:", spark.conf.get("spark.hadoop.fs.s3a.endpoint"))
 
     spark.stop()
     print("Spark 세션 종료.")

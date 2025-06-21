@@ -1,7 +1,7 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, to_timestamp, count, window, when, current_timestamp
+from pyspark.sql.functions import col, to_timestamp, count, window
 import pyspark.sql.functions as func
-from pyspark.sql.avro.functions import from_avro, to_avro
+from pyspark.sql.avro.functions import from_avro
 from pyspark.sql.types import *
 import argparse
 import requests
@@ -16,6 +16,7 @@ except ImportError:
     SchemaRegistryError = None
 from botocore.exceptions import ClientError
 from confluent_kafka.schema_registry.schema_registry_client import SchemaRegistryClient
+
 
 
 # 로깅 설정
@@ -153,19 +154,24 @@ def upsert_video_clicks_batch(batch_df, batch_id, video_clicks_summary_table_nam
 def main():
     try:
         parser = argparse.ArgumentParser(description='Kafka에서 데이터를 읽어 Iceberg 테이블에 저장하는 ETL')
+        # schema-registry
         parser.add_argument("--schema_registry_url", required=True, help='스키마 레지스트리 URL')
         parser.add_argument("--schema_subject", required=True, help='스키마 서브젝트 이름')
+        # kafka
         parser.add_argument("--kafka_brokers", required=True, help='Kafka 브로커 목록 (콤마로 구분)')
         parser.add_argument("--kafka_topic", required=True, help='Kafka 토픽 이름')
+        # icebrg
         parser.add_argument("--iceberg_catalog_name", required=True, help='Iceberg 카탈로그 이름')
         parser.add_argument("--iceberg_warehouse_path", required=True, help='Iceberg 웨어하우스 경로')
         parser.add_argument("--iceberg_db_name", required=True, help='Iceberg 데이터베이스 이름')
         parser.add_argument("--iceberg_table_name", required=True, help='원본 데이터 저장할 테이블 이름')
+        # minIO
         parser.add_argument("--checkpoint_location", required=True, help='체크포인트 위치')
         parser.add_argument("--s3_endpoint", required=True, help='S3 엔드포인트')
         parser.add_argument("--s3_access_key", required=True, help='S3 액세스 키')
         parser.add_argument("--s3_secret_key", required=True, help='S3 시크릿 키')
         parser.add_argument("--s3_region", required=True, help='S3 리전')
+        # monitoring
         parser.add_argument("--processing_time_trigger", default="30 seconds", help='처리 시간 트리거 (예: "30 seconds")')
         parser.add_argument("--schema_version_s3_bucket", required=True, help='스키마 버전 저장할 S3 버킷')
         parser.add_argument("--schema_version_s3_key", required=True, help='스키마 버전 저장할 S3 키')
@@ -229,6 +235,9 @@ def main():
         else:
             logger.info("Avro 스키마 변경 없음")
 
+        spark = None
+        active_queries = []
+
         # SparkSession 설정 - iceberge.type 명시 에러
         spark = SparkSession.builder \
         .appName("KafkaToIcebergETL") \
@@ -236,7 +245,6 @@ def main():
         .config("spark.driver.host", "127.0.0.1") \
         .config(f"spark.sql.catalog.{args.iceberg_catalog_name}", "org.apache.iceberg.spark.SparkCatalog") \
         .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.type", "hadoop") \
-        .config(f"spark.sql.catalog.iceberg.type", "hadoop") \
         .config(f"spark.sql.catalog.{args.iceberg_catalog_name}.warehouse", args.iceberg_warehouse_path) \
         .config("spark.hadoop.fs.s3a.endpoint", args.s3_endpoint) \
         .config("spark.hadoop.fs.s3a.access.key", args.s3_access_key) \
@@ -260,18 +268,6 @@ def main():
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {args.iceberg_catalog_name}.{args.iceberg_db_name}")
         logger.info(f"Database {args.iceberg_catalog_name}.{args.iceberg_db_name} ensured.")
 
-        # user_logs_iceberg_schema를 사용하여 user_logs 테이블이 존재하지 않으면 생성
-        # user_logs_iceberg_schema는 아래에서 정의되므로, 해당 정의 이후 또는 여기서 직접 사용
-        # 이 DDL은 user_logs_iceberg_schema 정의 이후로 옮기거나, 여기서 스키마를 다시 참조해야 합니다.
-        # 아래 user_logs_iceberg_schema 정의 후 DDL 실행 코드를 위치시키는 것이 더 깔끔합니다.
-        # (아래 user_logs_iceberg_schema 정의 후 관련 로직 추가됨)
-
-        # Kafka에서 데이터 읽기 (이 부분은 스키마 정의와 테이블 생성 로직 뒤로 이동하지 않아도 됨)
-        # ... (기존 Kafka 읽기 로직) ...
-        # 하지만, user_logs_iceberg_schema를 사용하는 테이블 생성 로직은
-        # 해당 스키마 변수가 정의된 이후에 와야 합니다.
-        # 현재 코드 흐름상 user_logs_iceberg_schema는 Kafka 데이터 처리 이후에 정의되므로,
-        # 테이블 생성 DDL은 그 이후에 위치해야 합니다.
 
         # Kafka에서 데이터 읽기
         df = spark.readStream \
@@ -308,6 +304,7 @@ def main():
             raise
 
         # 디버깅: 변환된 데이터 구조 확인
+        debug_decoded_query = None
         if logger.isEnabledFor(logging.DEBUG):
             # decoded_df (from_avro 직후, data.* 펼친 상태)를 콘솔에 출력
             debug_decoded_query = decoded_df.writeStream \
@@ -317,6 +314,7 @@ def main():
                 .option("numRows", 5) \
                 .start()
             logger.debug("디버그 스트림 시작됨 (콘솔 출력)")
+            active_queries.append(debug_decoded_query)
 
         # event_timestamp 컬럼 생성 (Iceberg 스키마의 event_timestamp와 매칭)
         # Avro 스키마의 'timestamp' (long, milliseconds)를 Spark TimestampType으로 변환
@@ -375,6 +373,7 @@ def main():
             logger.warning(f"Could not refresh table {raw_data_table} in catalog (this might be okay if it was just created): {e_refresh}")
 
         # 1. 원본 데이터를 Iceberg user_logs 테이블에 저장 (느슨한 결합)
+        raw_data_to_iceberg_query = None
         logger.info("Iceberg 'user_logs' 테이블 저장 스트림 설정 시작...")
         select_exprs_for_user_logs = []
         for field in user_logs_iceberg_schema.fields: # user_logs_iceberg_schema는 이전에 정의되어 있어야 함
@@ -397,6 +396,7 @@ def main():
                 .option("checkpointLocation", f"{args.checkpoint_location}/raw_data") \
                 .toTable(raw_data_table)
             logger.info(f"원본 데이터 Iceberg 테이블 스트림 시작됨: {raw_data_table}")
+            active_queries.append(raw_data_to_iceberg_query)    
     
         except Exception as e:
             error_message = f"원본 데이터 Iceberg 저장 설정 중 오류: {str(e)}"
@@ -405,8 +405,8 @@ def main():
             raise
 
         # 2. 비디오 클릭 집계
+        aggregated_data_query = None # 초기화
         try:
-            aggregated_data_query = None # 초기화
             # 집계는 event_timestamp 컬럼이 유효할 때만 수행
             if "event_timestamp" in df_with_event_timestamp.columns and \
                isinstance(df_with_event_timestamp.schema["event_timestamp"].dataType, TimestampType):
@@ -441,6 +441,7 @@ def main():
                     .trigger(processingTime=args.processing_time_trigger) \
                     .start()
                 logger.info(f"Iceberg 'video_clicks_summary' 테이블 저장 스트림 (foreachBatch) 정의 완료: {video_clicks_summary_table}")
+                active_queries.append(aggregated_data_query)
             else: # pragma: no cover
                 logger.warning("'event_timestamp' 컬럼이 없거나 TimestampType이 아니므로, 윈도우 집계를 건너뜁니다.")
         except Exception as e:
@@ -450,11 +451,59 @@ def main():
             # 이 오류는 치명적이지 않을 수 있으므로 원본 데이터 스트림은 유지
             logger.warning("비디오 클릭 집계 스트림은 시작되지 않았지만, 원본 데이터 스트림은 계속됩니다.")
 
+        # 모든 쿼리가 종료될 때까지 대기
+        if active_queries:
+            logger.info(f"{len(active_queries)}개의 활성 스트림 쿼리가 실행 중입니다. 종료 대기 중...")
+            for query in active_queries:
+                if query and query.isActive:
+                    query.awaitTermination()
+
     except Exception as e:
         error_message = f"애플리케이션 실행 중 예기치 않은 오류: {str(e)}"
         logger.error(error_message, exc_info=True)
-        send_slack_notification(args.slack_webhook_url, error_message)
-        raise
+        if 'args' in locals() and hasattr(args, 'slack_webhook_url'):
+            send_slack_notification(args.slack_webhook_url, error_message)
+        
+        # 활성화된 스트림 쿼리 종료
+        if 'active_queries' in locals() and active_queries:
+            for query in active_queries:
+                try:
+                    if query and query.isActive:
+                        query.stop()
+                        logger.info("스트림 쿼리가 정상적으로 종료되었습니다.")
+                except Exception as stop_error:
+                    logger.error(f"쿼리 종료 중 오류: {stop_error}")
+        
+        # SparkSession 종료 - 인스턴스 체크 후 종료
+        if spark is not None and not spark._jsc.sc().isStopped():
+            try:
+                spark.stop()
+                logger.info("SparkSession이 정상적으로 종료되었습니다.")
+            except Exception as stop_error:
+                logger.error(f"SparkSession 종료 중 오류: {stop_error}")
+        
+        # 명시적으로 현재 예외 다시 발생
+        sys.exit(1)  # 프로그램 종료 with error code
+        
+    finally:
+        # 정상 종료 시에도 SparkSession과 쿼리 정리
+        # 활성화된 스트림 쿼리 종료
+        if 'active_queries' in locals() and active_queries:
+            for query in active_queries:
+                try:
+                    if query and query.isActive:
+                        query.stop()
+                        logger.info("스트림 쿼리가 정상적으로 종료되었습니다.")
+                except Exception as stop_error:
+                    logger.error(f"쿼리 종료 중 오류: {stop_error}")
+        
+        # SparkSession 종료 - 인스턴스 체크 후 종료
+        if spark is not None and not spark._jsc.sc().isStopped():
+            try:
+                spark.stop()
+                logger.info("SparkSession이 정상적으로 종료되었습니다.")
+            except Exception as stop_error:
+                logger.error(f"SparkSession 종료 중 오류: {stop_error}")
 
 if __name__ == "__main__":
     main()
