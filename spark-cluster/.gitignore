@@ -1,0 +1,4 @@
+*.log
+*.yml
+*.__pycache__
+

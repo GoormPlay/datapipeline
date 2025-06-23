@@ -1,5 +1,0 @@
-fastapi
-uvicorn
-pyspark
-python-dotenv
-pandas

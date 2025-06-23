@@ -12,12 +12,12 @@ spark:
 
 # Schema Registry
 schema_registry:
-  url: "http://43.202.109.64:8081"
+  url: "http://15.164.236.86:8081"
   subject: "userlog-avro-topic-value"
 
 # Kafka
 kafka:
-  brokers: "43.202.109.64:9092,3.38.172.147:9092,43.203.178.64:9092"
+  brokers: "15.164.236.86:9092,3.35.5.47:9092,43.203.112.201:9092"
   topic: "userlog-avro-topic"
 
 # Iceberg
@@ -33,9 +33,19 @@ s3:
   endpoint: "http://54.180.166.228:9000"
   access_key: "${S3_ACCESS_KEY}"
   secret_key: "${S3_SECRET_KEY}"
+  s3_region: "ap-northeast-2"
   path_style_access: true
   connection_ssl_enabled: false
 
 # Streaming Configuration
 streaming:
   processing_time_trigger: "30 minutes"
+
+# Schema Version State Management
+schema_version_state:
+  s3_bucket: "userlog-data" # 또는 ${SCHEMA_VERSION_S3_BUCKET}
+  s3_key: "schema_versions/userlog-avro-topic-value.version" # 또는 ${SCHEMA_VERSION_S3_KEY}
+
+# Slack (선택 사항)
+slack:
+  webhook_url: "${SLACK_WEBHOOK_URL}" # 환경 변수 또는 직접 값
