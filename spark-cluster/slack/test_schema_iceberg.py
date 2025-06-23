@@ -9,6 +9,7 @@ import hashlib
 import json
 import boto3
 import logging
+import sys
 try:
     from confluent_kafka.schema_registry import SchemaRegistryClient, SchemaRegistryError
 except ImportError:
@@ -371,6 +372,26 @@ def main():
         except Exception as e_refresh:
             # If the table truly didn't exist before the DDL, refreshTable might fail.
             logger.warning(f"Could not refresh table {raw_data_table} in catalog (this might be okay if it was just created): {e_refresh}")
+
+        # 2. video_clicks_summary 테이블 생성 (존재하지 않을 경우)
+        # 이 테이블은 집계된 결과를 저장합니다.
+        summary_table_ddl = f"""
+        CREATE TABLE IF NOT EXISTS {video_clicks_summary_table} (
+            window_start TIMESTAMP,
+            window_end TIMESTAMP,
+            videoId STRING,
+            title STRING,
+            click_count LONG
+        )
+        USING iceberg
+        PARTITIONED BY (hours(window_start))
+        """
+        logger.info(f"Ensuring table {video_clicks_summary_table} exists...")
+        spark.sql(summary_table_ddl)
+        logger.info(f"Table {video_clicks_summary_table} ensured.")
+        spark.catalog.refreshTable(video_clicks_summary_table)
+        logger.info(f"Refreshed catalog for table {video_clicks_summary_table}")
+
 
         # 1. 원본 데이터를 Iceberg user_logs 테이블에 저장 (느슨한 결합)
         raw_data_to_iceberg_query = None
