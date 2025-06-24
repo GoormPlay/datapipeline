@@ -71,10 +71,12 @@ def generate_event_avro(**kwargs):
     producer_config = {
         'bootstrap.servers': kafka_cluster,
         'schema.registry.url': SCHEMA_REGISTRY_URL,
-        'num_partition': 3,
-        'replication_factor': 2,
-        'acks': all,
+        'enable.idempotence': True, # 멱등성 설정
+        'acks': 'all', # 멱등성을 위해 'all' 또는 '-1'
         'retries': 10,
+        # 멱등성 보장을 위한 설정: ACK 응답 대기 요청을 최대 5개까지만 생성
+        # 멱등성 보장에 따른 비효율 발생을 줄임
+        'max.in.flight.requests.per.connection': 5,
         'linger.ms': 200,
     }
 
@@ -173,24 +175,67 @@ def generate_event_avro(**kwargs):
     print(f"🚀 Producing {num_events:,} dummy Avro messages to Kafka topic `{KAFKA_TOPIC_AVRO}`")
 
     start_time = time.time()
-    produced_count = 0
-    for i in range(num_events):
-        msg_payload = make_event_payload()
-        try:
-            # AvroProducer는 value에 dict를 전달하면 스키마에 따라 직렬화
-            avro_producer.produce(topic=KAFKA_TOPIC_AVRO, value=msg_payload, callback=delivery_report)
-            produced_count += 1
-        except BufferError:
-            print("Local producer queue is full... flushing pending messages.")
-            avro_producer.flush() # 버퍼가 꽉 차면 flush
-            # 재시도
-            avro_producer.produce(topic=KAFKA_TOPIC_AVRO, value=msg_payload, callback=delivery_report)
-            produced_count += 1
-        except Exception as e:
-            print(f"❌ Error producing message: {e}")
+    produced_count = 0 # 총 생산된 메시지 수
+    transaction_size = 1000 # 트랜잭션당 메시지 수 (이 값을 조절하여 성능 테스트 가능)
+    messages_in_batch = [] # 현재 배치에 포함된 메시지
 
-        if i % 10000 == 0:
-            avro_producer.poll(0)
+    try:
+        # 1. initTransaction(): 트랜잭션 준비
+        avro_producer.init_transactions()
+        print("✅ Transactional producer initialized.")
+
+        for i in range(num_events):
+            msg_payload = make_event_payload()
+            messages_in_batch.append(msg_payload)
+
+            if len(messages_in_batch) >= transaction_size or i == num_events - 1:
+                try:
+                    # 2. beginTransaction(): 트랜잭션 시작
+                    avro_producer.begin_transaction()
+                    for msg in messages_in_batch:
+                        # 3. send(): 트랜잭션 내 레코드 배치 생성
+                        avro_producer.produce(topic=KAFKA_TOPIC_AVRO, value=msg, callback=delivery_report)
+                        produced_count += 1
+                    # 4. commitTransaction(): flush 동작을 포함
+                    avro_producer.commit_transaction()
+                    print(f"✅ Committed {len(messages_in_batch)} messages in a transaction. Total produced: {produced_count}")
+                    messages_in_batch = [] # 배치 초기화
+                except KafkaError as e:
+                    print(f"❌ Transaction failed: {e}. Aborting transaction.")
+                    avro_producer.abort_transaction()
+                    # 트랜잭션 실패 시, 해당 배치 메시지는 다시 시도하지 않음 (재처리 로직 필요시 추가)
+                    messages_in_batch = []
+                    # 심각한 오류의 경우 DAG 실패 처리
+                    if e.code() == ConfluentKafkaError.FATAL:
+                        raise e
+                except Exception as e:
+                    print(f"❌ Unexpected error during transaction: {e}. Aborting transaction.")
+                    avro_producer.abort_transaction()
+                    messages_in_batch = []
+                    raise e
+
+            # 주기적으로 poll() 호출하여 콜백 처리 및 버퍼 관리
+            if i % 1000 == 0: # 1000 메시지마다 poll
+                avro_producer.poll(0)
+
+    except Exception as e:
+        print(f"❌ Error during event generation: {e}")
+        raise e
+    finally:
+        # Ensure any remaining messages in the producer buffer are flushed
+        # This is important for non-transactional producers or if the last transaction was small
+        # For transactional producers, commit_transaction() handles flushing.
+        # However, if an error occurred before begin_transaction or after abort_transaction,
+        # there might be messages in the buffer that need to be flushed.
+        # Confluent Kafka's AvroProducer.flush() will also handle pending transactional messages.
+        print(f"⏳ Flushing remaining messages ({len(avro_producer)} messages in queue)...")
+        remaining_messages = avro_producer.flush(timeout=30)
+        if remaining_messages > 0:
+            print(f"⚠️ {remaining_messages} messages still in queue after final flush timeout.")
+        
+        end_time = time.time()
+        print(f"✅ Sent {produced_count:,} Avro events in {end_time - start_time:.2f} seconds to topic '{KAFKA_TOPIC_AVRO}'")
+        print("✅ Dummy Avro events generation process finished.")
 
     print(f"⏳ Flushing remaining messages ({len(avro_producer)} messages in queue)...")
     remaining_messages = avro_producer.flush(timeout=30)
