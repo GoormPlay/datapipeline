@@ -1,0 +1,244 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+import random
+import time
+from datetime import datetime, timedelta
+
+from faker import Faker
+
+# confluent_kafka 및 Avro 관련 import 추가
+from confluent_kafka.avro import AvroProducer
+from confluent_kafka import KafkaError as ConfluentKafkaError # KafkaError 이름 충돌 방지
+
+# MongoDB 연결을 위한 pymongo import
+try:
+    from pymongo import MongoClient
+    from pymongo.errors import ConnectionFailure
+    PYMONGO_AVAILABLE = True
+except ImportError:
+    PYMONGO_AVAILABLE = False
+    MongoClient = None
+    ConnectionFailure = None
+
+from utils.slack_fail_noti import task_fail_slack_alert
+
+kafka_cluster = '15.164.236.86:9092,3.35.5.47:9092,43.203.112.201:9092'
+SCHEMA_REGISTRY_URL = 'http://15.164.236.86:8081' # Schema Registry URL
+KAFKA_TOPIC_AVRO = 'userlog-avro-topic'         # Avro 메시지를 위한 Kafka 토픽
+
+# Avro 스키마 정의 (make_event 함수 구조 기반)
+AVRO_SCHEMA_STRING = """
+{
+  "type": "record",
+  "name": "UserEvent",
+  "fields": [
+    {"name": "videoId", "type": ["null", "string"]},
+    {"name": "title", "type": ["null", "string"]},
+    {"name": "userId", "type": ["null","string"]},
+    {"name": "timestamp", "type": ["null", "long"]},
+    {"name": "eventType", "type": ["null", "string"]},
+    {"name": "page", "type": ["null", "string"]},
+    {"name": "liked", "type": ["null", "boolean"]},
+    {"name": "review", "type": ["null", "string"]},
+    {"name": "rating", "type": ["null", "int"]},
+    {"name": "genre", "type": ["null", {"type": "array", "items": "string"}], "default": null},
+    {"name": "recMovieList", "type": ["null", "string"], "default": null}
+  ]
+}
+"""
+
+def delivery_report(err, msg):
+    """ Called once for each message produced to indicate delivery result.
+        Triggered by poll() or flush(). """
+    if err is not None:
+        print(f"❌ Message delivery failed: {err}")
+    else:
+        # Log a small percentage of successful deliveries to avoid excessive logging
+        if random.random() < 0.0001: # Log 0.01% of successful messages
+             print(f"✅ Message delivered to {msg.topic()} [{msg.partition()}] @ offset {msg.offset()}")
+
+
+def generate_event_avro(**kwargs):
+    fake = Faker()
+
+    producer_config = {
+        'bootstrap.servers': kafka_cluster,
+        'schema.registry.url': SCHEMA_REGISTRY_URL,
+        'enable.idempotence': True,  # 멱등성 설정
+        'acks': 'all',  # 멱등성을 위해 'all' 또는 '-1'
+        'retries': 10, # 1 이상의 값으로 설정
+        # 멱등성 보장을 위한 설정: ACK 응답 대기 요청을 최대 5개까지만 생성
+        'max.in.flight.requests.per.connection': 5,
+        'linger.ms': 200,
+    }
+
+    avro_producer = AvroProducer(
+        producer_config,
+        default_value_schema=AVRO_SCHEMA_STRING
+    )
+
+    mongo_contents_data = []
+    if PYMONGO_AVAILABLE:
+        try:
+            # MongoDB 연결 정보 - 실제 환경에 맞게 수정하세요.
+            # 예: client = MongoClient('mongodb://user:pass@host:port/admin')
+            client = MongoClient('mongodb+srv://user:goorm0508@goorm-mongodb.svz66jf.mongodb.net/?retryWrites=true&w=majority&appName=goorm-mongoDB') # 로컬 MongoDB 예시
+            client.admin.command('ping') # 연결 테스트
+            db = client['content-db']
+            contents_collection = db['contents']
+            # 'title'과 'videoId' 필드만 가져옵니다. _id는 제외합니다.
+            # 실제 MongoDB의 필드명이 'videoId'가 아니라면 해당 필드명으로 수정해야 합니다.
+            mongo_contents_data = list(contents_collection.find({}, {"_id": 0, "title": 1, "videoId": 1, "genre": 1}))
+            client.close()
+            if mongo_contents_data:
+                print(f"✅ Successfully fetched {len(mongo_contents_data)} items from MongoDB 'contents' collection.")
+            else:
+                print("ℹ️ No data fetched from MongoDB 'contents' collection or collection is empty.")
+        except ConnectionFailure:
+            print("❌ Failed to connect to MongoDB. Will proceed without MongoDB data.")
+        except Exception as e:
+            print(f"❌ Error fetching data from MongoDB: {e}. Will proceed without MongoDB data.")
+
+    num_events = 1_00_000  # 필요한 양으로 조절 가능
+    # num_events = 1000 # 테스트용
+
+    event_types = ["like_click", "content_click", "review_write", "rating_submit", "paly_start", "paly_stop", "content_recom_click"]
+
+    def make_event_payload(): # 함수명 변경하여 명확화
+        # Avro 스키마에 정의된 모든 필드를 초기에 None으로 설정 (userId, timestamp 등은 아래에서 덮어쓰여짐)
+        event = {
+            "videoId": None,
+            "title": None,
+            "userId": None, # Placeholder, will be overwritten
+            "timestamp": None, # Placeholder, will be overwritten
+            "eventType": None, # Placeholder, will be overwritten
+            "page": None, # Placeholder, will be overwritten
+            "liked": None,
+            "review": None,
+            "rating": None,
+            "genre": None,
+            "recMovieList": None
+        }
+        if mongo_contents_data:
+            selected_content = random.choice(mongo_contents_data)
+            event["videoId"] = selected_content.get("videoId")
+            event["title"] = selected_content.get("title")
+            event["genre"] = selected_content.get("genre")
+        # else: # 이 else 블록을 제거하고 아래 로직을 항상 실행하도록 변경
+        # videoId와 title은 mongo_contents_data가 없으면 이미 None으로 설정됨 (위에서 처리)
+
+        # userId, timestamp, eventType은 MongoDB 데이터 유무와 관계없이 항상 생성
+        fake_datetime = fake.date_time_between(start_date="-1d", end_date="now")
+        unix_timestamp = int(fake_datetime.timestamp() * 1000)  # 초를 밀리초로 변환
+
+        event.update({ # 필수 필드 및 기본값 없는 필드 업데이트
+            "userId": fake.uuid4(),
+            "timestamp": unix_timestamp,
+            "eventType": random.choice(event_types)
+        })
+
+        if event["eventType"] == "like_click":
+            event["page"] = "content_detail"
+            event["liked"] = random.choice([True, False])
+        elif event["eventType"] == "review_write":
+            event["page"] = "content_detail"
+            event["review"] = fake.sentence()
+        elif event["eventType"] == "rating_submit":
+            event["page"] = "content_detail"
+            event["rating"] = random.randint(1, 5)
+        elif event["eventType"] == "content_click": # 'else' 대신 명시적으로 'content_click' 처리
+            event["page"] = "content_detail"
+        elif event["eventType"] == "content_recom_click":
+            event["page"] = "content_detail"
+            event["recMovieList"] = fake.sentence()
+        elif event["eventType"] == "paly_start":
+            event["page"] = "content_paly"
+        elif event["eventType"] == "paly_stop":
+            event["page"] = "content_paly"
+
+        # 다른 eventType의 경우, 해당 특정 필드들은 None으로 유지됨
+        return event
+
+    print(f"🚀 Producing {num_events:,} dummy Avro messages to Kafka topic `{KAFKA_TOPIC_AVRO}`")
+
+    start_time = time.time()
+    produced_count = 0  # 총 생산된 메시지 수
+    transaction_size = 1000  # 트랜잭션당 메시지 수 (이 값을 조절하여 성능 테스트 가능)
+    messages_in_batch = []  # 현재 배치에 포함된 메시지
+
+    try:
+        # 1. initTransaction(): 트랜잭션 준비
+        avro_producer.init_transactions()
+        print("✅ Transactional producer initialized.")
+
+        for i in range(num_events):
+            msg_payload = make_event_payload()
+            messages_in_batch.append(msg_payload)
+
+            # 배치가 꽉 차거나 마지막 메시지일 경우 트랜잭션 처리
+            if len(messages_in_batch) >= transaction_size or i == num_events - 1:
+                try:
+                    # 2. beginTransaction(): 트랜잭션 시작
+                    avro_producer.begin_transaction()
+                    for msg in messages_in_batch:
+                        # 3. send(): 트랜잭션 내 레코드 배치 생성
+                        avro_producer.produce(topic=KAFKA_TOPIC_AVRO, value=msg, callback=delivery_report)
+                        produced_count += 1
+                    # 4. commitTransaction(): flush 동작을 포함하여 트랜잭션 커밋
+                    avro_producer.commit_transaction()
+                    print(f"✅ Committed {len(messages_in_batch)} messages in a transaction. Total produced: {produced_count}")
+                    messages_in_batch = []  # 배치 초기화
+                except ConfluentKafkaError as e:
+                    print(f"❌ Transaction failed: {e}. Aborting transaction.")
+                    avro_producer.abort_transaction()
+                    messages_in_batch = []
+                    # 심각한 오류의 경우 DAG 실패 처리
+                    if e.code() == ConfluentKafkaError._FATAL:
+                        raise e
+                except Exception as e:
+                    print(f"❌ Unexpected error during transaction: {e}. Aborting transaction.")
+                    avro_producer.abort_transaction()
+                    messages_in_batch = []
+                    raise e
+
+            # 주기적으로 poll() 호출하여 콜백 처리 및 버퍼 관리
+            if i % 10000 == 0:
+                avro_producer.poll(0)
+
+    except Exception as e:
+        print(f"❌ Error during event generation: {e}")
+        raise e
+    finally:
+        print(f"⏳ Flushing remaining messages ({len(avro_producer)} messages in queue)...")
+        remaining_messages = avro_producer.flush(timeout=30)
+        if remaining_messages > 0:
+            print(f"⚠️ {remaining_messages} messages still in queue after final flush timeout.")
+        
+        end_time = time.time()
+        print(f"✅ Sent {produced_count:,} Avro events in {end_time - start_time:.2f} seconds to topic '{KAFKA_TOPIC_AVRO}'")
+        print("✅ Dummy Avro events generation process finished.")
+
+
+with DAG(
+    'generate_dummy_avro', # DAG ID 변경
+    default_args={
+        'depends_on_past':False,
+        'retries':1, # 대량 데이터 생성 실패 시 재시도 부담 줄임
+        'retry_delay':timedelta(minutes=5),
+        'execution_timeout':timedelta(minutes=360), # 실행 시간은 유지
+    },
+    description="Generates dummy user log data in Avro format to Kafka", # 설명 변경
+    start_date=datetime(2025, 6, 12),
+    catchup=False,
+    schedule_interval='0 1 * * *', # 스케줄 변경 (예시)
+    tags=['dummy', 'avro', 'kafka'] # 태그 변경
+) as dag:
+    
+    produce_dummy_avro_data = PythonOperator(
+        task_id='produce_dummy_avro_data', # 태스크 ID 변경
+        python_callable=generate_event_avro,
+        on_failure_callback=task_fail_slack_alert
+    )
+
+    produce_dummy_avro_data
