@@ -319,4 +319,4 @@ def run_custom_query(query: str, limit: int = 1000):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("simple_iceberg_api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("streaming_iceberg_api:app", host="0.0.0.0", port=8000, reload=True)

@@ -231,6 +231,11 @@ def run_multithreaded_consumer_test(scenario, config, max_messages, num_threads=
     print(f"🧪 멀티스레드 컨슈머 테스트 시작: {scenario['name']} - {config['name']} (스레드 수: {num_threads})")
     print(f"⚙️ 설정: fetch.min.bytes={config['fetch_min_bytes']}, max.partition.fetch.bytes={config['max_partition_fetch_bytes']}")
     print(f"{'=' * 60}")
+
+    # Schema Registry 설정 (멀티스레드 테스트에서도 필요)
+    schema_registry_conf = {'url': SCHEMA_REGISTRY_URL}
+    schema_registry_client = SchemaRegistryClient(schema_registry_conf)
+    avro_deserializer = AvroDeserializer(schema_registry_client)
     
     # 공유 변수 설정
     message_count = 0
@@ -267,24 +272,29 @@ def run_multithreaded_consumer_test(scenario, config, max_messages, num_threads=
                 # 메시지 처리 시작 시간
                 msg_process_start = time.time()
                 
-                # 메시지 처리
-                process_message(msg.value())
-                
-                # 처리 시간 측정 (밀리초)
-                processing_time_ms = (time.time() - msg_process_start) * 1000
-                
-                with lock:
-                    # 처리된 메시지 기록
-                    monitor.record_message_processed(processing_time_ms)
-                    # 메시지 카운트 증가
-                    message_count += 1
-                    local_count += 1
+                try:
+                    # Avro 메시지 디시리얼라이즈
+                    value = avro_deserializer(msg.value(), SerializationContext(msg.topic(), MessageField.VALUE))
+                    # 메시지 처리
+                    process_message(value)
                     
-                    # 메시지의 타임스탬프와 현재 시간 비교하여 지연 측정
-                    event_time = msg.value().get('timestamp', time.time() * 1000)
-                    current_time = int(time.time() * 1000)
-                    lag_ms = current_time - event_time
-                    monitor.record_lag(lag_ms)
+                    # 처리 시간 측정 (밀리초)
+                    processing_time_ms = (time.time() - msg_process_start) * 1000
+                    
+                    with lock:
+                        # 처리된 메시지 기록
+                        monitor.record_message_processed(processing_time_ms)
+                        # 메시지 카운트 증가
+                        message_count += 1
+                        local_count += 1
+                        
+                        # 메시지의 타임스탬프와 현재 시간 비교하여 지연 측정
+                        event_time = value.get('timestamp', time.time() * 1000)
+                        current_time = int(time.time() * 1000)
+                        lag_ms = current_time - event_time
+                        monitor.record_lag(lag_ms)
+                except Exception as e:
+                    print(f"❌ 스레드 {thread_id} 메시지 처리 오류: {e}")
                     
                     if message_count >= max_messages:
                         should_stop.set()
@@ -445,7 +455,7 @@ def main():
     parallel_strategies = [
         {
             'type': 'multithreaded',
-            'thread_counts': [3, 6, 12]
+            'thread_counts': [3, 5]
         }
     ] if args.parallel else None
     
@@ -520,4 +530,4 @@ if __name__ == "__main__":
 # python kafka_consumer_benchmark.py --scenario special
 
 # # 모든 시나리오 테스트
-# python kafka_consumer_benchmark.py --scenario all
+# python kafka_consumer_benchmark.py --scenario all --parallel
