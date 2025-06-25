@@ -9,15 +9,16 @@ spark:
     - "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.3.1"
     - "org.apache.hadoop:hadoop-aws:3.3.2"
     - "com.amazonaws:aws-java-sdk-bundle:1.12.262"
+## spark version 3.4.1 호환 jars
 
 # Schema Registry
 schema_registry:
-  url: "http://15.164.236.86:8081"
+  url: "http://15.165.7.37:8081"
   subject: "userlog-avro-topic-value"
 
 # Kafka
 kafka:
-  brokers: "15.164.236.86:9092,3.35.5.47:9092,43.203.112.201:9092"
+  brokers: "15.165.7.37:9092,3.35.6.38:9092,3.38.200.113:9092"
   topic: "userlog-avro-topic"
 
 # Iceberg

@@ -2,184 +2,232 @@ import streamlit as st
 import pandas as pd
 import requests
 import os
+import plotly.express as px
 
 # API 기본 URL 설정 (FastAPI 서버 주소)
-# 환경 변수가 없으면 http://localhost:8000를 기본값으로 사용
 API_BASE_URL = os.getenv("API_URL", "http://localhost:8000")
 
-# --- API 호출 함수 ---
-
-@st.cache_data(ttl=600) # API 응답을 10분 동안 캐싱하여 불필요한 호출 방지
-def get_databases():
-    """/databases 엔드포인트를 호출하여 데이터베이스 목록을 가져옵니다."""
-    try:
-        response = requests.get(f"{API_BASE_URL}/databases")
-        response.raise_for_status() # 200번대 코드가 아니면 예외 발생
-        data = response.json()
-        if "databases" in data:
-            return data["databases"]
-        else:
-            st.error(f"API에서 데이터베이스 목록을 가져오는 데 실패했습니다: {data.get('error', '알 수 없는 오류')}")
-            return []
-    except requests.exceptions.RequestException as e:
-        st.error(f"API 서버({API_BASE_URL})에 연결할 수 없습니다: {e}")
-        return []
-
-@st.cache_data(ttl=600)
-def get_tables(database: str):
-    """/tables 엔드포인트를 호출하여 특정 데이터베이스의 테이블 목록을 가져옵니다."""
-    if not database:
-        return []
-    try:
-        response = requests.get(f"{API_BASE_URL}/tables", params={"database": database})
-        response.raise_for_status()
-        data = response.json()
-        if "tables" in data:
-            return data["tables"]
-        else:
-            st.error(f"'{database}'의 테이블 목록을 가져오는 데 실패했습니다: {data.get('error', '알 수 없는 오류')}")
-            return []
-    except requests.exceptions.RequestException as e:
-        st.error(f"API 서버에 연결할 수 없습니다: {e}")
-        return []
-
-@st.cache_data(ttl=300) # 데이터는 5분 동안 캐싱
-def get_table_data(database: str, table: str, limit: int = 100):
-    """/table-data 엔드포인트를 호출하여 테이블 데이터를 가져옵니다."""
-    if not database or not table:
-        return None
-    try:
-        params = {"database": database, "table": table, "limit": limit}
-        response = requests.get(f"{API_BASE_URL}/table-data", params=params)
-        response.raise_for_status()
-        data = response.json()
-        if "data" in data:
-            return pd.DataFrame(data["data"])
-        else:
-            st.error(f"'{database}.{table}'의 데이터를 가져오는 데 실패했습니다: {data.get('error', '알 수 없는 오류')}")
-            return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"API 서버에 연결할 수 없습니다: {e}")
-        return None
-
-@st.cache_data(ttl=60) # 쿼리 결과는 1분만 캐싱
-def run_query(query: str):
-    """/run-query 엔드포인트를 호출하여 사용자 정의 쿼리를 실행합니다."""
-    if not query:
-        return None, None, "쿼리가 비어있습니다."
-    try:
-        # API는 GET 요청이므로 쿼리를 URL 파라미터로 전달
-        params = {"query": query}
-        response = requests.get(f"{API_BASE_URL}/run-query", params=params)
-        response.raise_for_status()
-        data = response.json()
-
-        executed_query = data.get("query") # API가 수정한 쿼리를 가져옴
-
-        if "data" in data:
-            return pd.DataFrame(data["data"]), executed_query, None # df, executed_query, error
-        else:
-            error_message = data.get('error', '알 수 없는 오류')
-            return None, executed_query, error_message
-    except requests.exceptions.RequestException as e:
-        return None, query, f"API 서버 연결 오류: {e}" # df, executed_query, error
-    except Exception as e:
-        return None, query, f"알 수 없는 오류 발생: {e}"
-
 # --- Streamlit UI 구성 ---
+st.set_page_config(layout="wide", page_title="사용자 행동 분석 대시보드", page_icon="📈")
 
-st.set_page_config(layout="wide", page_title="Iceberg 데이터 시각화 대시보드")
+st.title("📈 사용자 행동 분석 대시보드")
+st.markdown("FastAPI를 통해 실시간으로 집계된 Iceberg 테이블 데이터를 조회합니다.")
 
-st.title("🧊 Iceberg 데이터 탐색기")
-st.write("FastAPI를 통해 Iceberg 테이블의 데이터를 조회하고 시각화하는 대시보드입니다.")
+# --- API 호출 함수 ---
+@st.cache_data(ttl=60) # API 응답을 1분 동안 캐싱
+def fetch_analytics_data(endpoint: str, limit: int):
+    """분석 API 엔드포인트에서 데이터를 가져옵니다."""
+    try:
+        url = f"{API_BASE_URL}/{endpoint}" # 전체 경로를 받도록 수정
+        params = {"limit": limit} # limit은 공통 파라미터로 사용
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        return pd.DataFrame(response.json())
+    except requests.exceptions.RequestException as e:
+        st.error(f"API 서버({url}) 호출 중 오류 발생: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"데이터 처리 중 오류 발생: {e}")
+        return pd.DataFrame()
 
-# 사이드바: 데이터베이스 및 테이블 선택
-st.sidebar.header("데이터 선택")
-databases = get_databases()
-if not databases:
-    st.warning("조회할 데이터베이스가 없거나 API 서버에 연결할 수 없습니다. FastAPI 서버가 실행 중인지 확인하세요.")
-else:
-    selected_db = st.sidebar.selectbox("1. 데이터베이스 선택", options=databases)
+@st.cache_data(ttl=60)
+def fetch_recent_data(endpoint: str, minutes: int, limit: int):
+    """최근 데이터 조회 API를 호출합니다."""
+    try:
+        url = f"{API_BASE_URL}/{endpoint}"
+        params = {"minutes_ago": minutes, "limit": limit}
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        return pd.DataFrame(response.json())
+    except requests.exceptions.RequestException as e:
+        st.error(f"API 서버({url}) 호출 중 오류 발생: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"데이터 처리 중 오류 발생: {e}")
+        return pd.DataFrame()
 
-    if selected_db:
-        tables = get_tables(selected_db)
-        if not tables:
-            st.info(f"'{selected_db}' 데이터베이스에 테이블이 없습니다.")
+@st.cache_data(ttl=60)
+def fetch_raw_log_data(limit: int, where_clause: str = ""):
+    """/table-data 엔드포인트에서 user_logs 데이터를 가져옵니다."""
+    try:
+        url = f"{API_BASE_URL}/table-data"
+        # API 파라미터에 빈 where_clause는 보내지 않도록 처리
+        params = {
+            "database": "analytics",
+            "table": "user_logs",
+            "limit": limit,
+        }
+        if where_clause:
+            params["where_clause"] = where_clause
+
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        response_data = response.json()
+        if "data" in response_data:
+            return pd.DataFrame(response_data["data"])
         else:
-            selected_table = st.sidebar.selectbox("2. 테이블 선택", options=tables)
-            limit = st.sidebar.slider("가져올 데이터 수", 10, 1000, 100)
+            st.error(f"API 응답에 'data' 키가 없습니다: {response_data.get('error', '알 수 없는 오류')}")
+            return pd.DataFrame()
+    except requests.exceptions.RequestException as e:
+        st.error(f"API 서버({url}) 호출 중 오류 발생: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"데이터 처리 중 오류 발생: {e}")
+        return pd.DataFrame()
 
-            if st.sidebar.button("데이터 불러오기", type="primary"):
-                # 사용자가 선택한 값을 session_state에 저장하여 앱이 재실행되어도 유지
-                st.session_state.selected_db = selected_db
-                st.session_state.selected_table = selected_table
-                st.session_state.limit = limit
+# 사이드바
+with st.sidebar:
+    st.header("⚙️ 컨트롤 패널")
+    limit = st.slider("상위 N개 항목 조회", min_value=5, max_value=50, value=10, step=5)
+    if st.button("데이터 새로고침", type="primary"):
+        st.cache_data.clear()
+        st.rerun()
 
-# 메인 화면: 데이터 표시 및 시각화
-if 'selected_table' in st.session_state and st.session_state.selected_table:
-    db = st.session_state.selected_db
-    table = st.session_state.selected_table
-    limit = st.session_state.limit
+# 탭 생성
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🕒 실시간 활동",
+    "📈 사용자 관심도", 
+    "▶️ 인기 재생", 
+    "🖱️ 인기 추천",
+    "💥 종합 클릭 (기존)",
+    "📜 원본 로그 조회"
+])
 
-    st.header(f"'{db}.{table}' 데이터 미리보기 (최대 {limit}개)")
-
-    with st.spinner("데이터를 불러오는 중입니다..."):
-        df = get_table_data(db, table, limit)
-
-    if df is not None and not df.empty:
-        st.dataframe(df)
-
-        # video_clicks_summary 테이블에 대한 특별 시각화
-        if table == "video_clicks_summary":
-            st.header("🎬 인기 비디오 TOP 10")
-            if "title" in df.columns and "click_count" in df.columns:
-                # click_count 기준으로 내림차순 정렬 후 상위 10개 선택
-                top_10_videos = df.sort_values(by="click_count", ascending=False).head(10)
-                
-                if not top_10_videos.empty:
-                    # Streamlit의 bar_chart는 x, y 인자를 직접 받을 수 있습니다.
-                    st.bar_chart(top_10_videos, x="title", y="click_count")
-                    st.write("가장 많이 클릭된 비디오:")
-                    st.dataframe(top_10_videos.set_index("title"))
-                else:
-                    st.info("인기 비디오를 시각화할 데이터가 충분하지 않습니다.")
-            else:
-                st.warning("`video_clicks_summary` 테이블에 'title' 또는 'click_count' 컬럼이 없습니다.")
-
-        st.header("📊 자동 시각화")
-        st.write("데이터 타입에 따라 기본적인 시각화를 제공합니다.")
-
-        # 시각화할 컬럼 선택
-        vis_cols = st.multiselect("시각화할 컬럼을 선택하세요.", options=df.columns)
-
-        if vis_cols:
-            for col in vis_cols:
-                with st.container(border=True):
-                    st.subheader(f"`{col}` 컬럼 분석")
-                    # 숫자형 데이터 처리
-                    if pd.api.types.is_numeric_dtype(df[col]):
-                        st.write("**요약 통계:**")
-                        st.write(df[col].describe())
-                        
-                        st.write("**값 분포 (막대 차트):**")
-                        # NaN 값을 제외하고 시각화
-                        chart_data = df[col].dropna().value_counts()
-                        if not chart_data.empty:
-                            st.bar_chart(chart_data)
-                        else:
-                            st.info("데이터가 없어 차트를 그릴 수 없습니다.")
-                    
-                    # 카테고리형(Object) 데이터 처리
-                    else:
-                        st.write("**값 별 개수:**")
-                        value_counts = df[col].value_counts()
-                        st.bar_chart(value_counts)
-                        st.write(value_counts)
-
-    elif df is not None and df.empty:
-        st.info("테이블에 데이터가 없습니다.")
+# 1. 실시간 활동 탭 (신규)
+with tab1:
+    st.header("🕒 실시간 활동 (최근 30분)")
+    st.markdown("최근 30분 동안 집계된 사용자 관심도 순위입니다. 현재 가장 '핫'한 콘텐츠를 보여줍니다.")
+    with st.spinner("최근 활동 데이터 로딩 중..."):
+        df_recent = fetch_recent_data("analytics/recent-user-interest", minutes=30, limit=limit)
+    
+    if not df_recent.empty:
+        fig = px.bar(df_recent, 
+                     x="recent_score", 
+                     y="title", 
+                     orientation='h', 
+                     title=f"최근 30분간 사용자 관심도 TOP {limit}", 
+                     labels={"recent_score": "최근 관심도 점수", "title": "콘텐츠 제목"},
+                     text='recent_score')
+        fig.update_layout(yaxis={'categoryorder':'total ascending'})
+        st.plotly_chart(fig, use_container_width=True)
+        
+        with st.expander("상세 데이터 보기"):
+            st.dataframe(df_recent)
     else:
-        st.error("데이터를 불러오지 못했습니다. API 서버 로그를 확인해주세요.")
+        st.info("최근 30분 내에 집계된 데이터가 없습니다.")
 
-else:
-    st.info("왼쪽 사이드바에서 데이터베이스와 테이블을 선택하고 '데이터 불러오기' 버튼을 클릭하세요.")
+# 2. 사용자 관심도 탭
+with tab2:
+    st.header("📈 사용자 관심도 높은 콘텐츠")
+    st.markdown("좋아요, 리뷰, 평점, 재생 시작 등을 종합하여 **사용자별 관심도 점수**가 가장 높은 콘텐츠입니다.")
+    with st.spinner("데이터 로딩 중..."):
+        df_interest = fetch_analytics_data("analytics/user-interest", limit)
+    
+    if not df_interest.empty:
+        # Plotly로 시각화 개선
+        fig = px.bar(df_interest, 
+                     x="total_score", 
+                     y="title", 
+                     orientation='h', 
+                     title=f"상위 {limit}개 콘텐츠의 사용자 관심도 점수", 
+                     labels={"total_score": "총 관심도 점수", "title": "콘텐츠 제목"},
+                     text='total_score')
+        fig.update_layout(yaxis={'categoryorder':'total ascending'})
+        st.plotly_chart(fig, use_container_width=True)
+        
+        with st.expander("상세 데이터 보기"):
+            st.dataframe(df_interest)
+    else:
+        st.warning("표시할 사용자 관심도 데이터가 없습니다. Spark 스트리밍 작업이 실행 중인지 확인해주세요.")
+
+# 3. 가장 많이 재생된 콘텐츠 탭
+with tab3:
+    st.header("▶️ 가장 많이 재생된 콘텐츠")
+    st.markdown("사용자들이 **재생 시작(play_start)** 버튼을 가장 많이 누른 콘텐츠입니다.")
+    with st.spinner("데이터 로딩 중..."):
+        df_played = fetch_analytics_data("analytics/top-played", limit)
+    
+    if not df_played.empty:
+        fig = px.bar(df_played, 
+                     x="total_plays", 
+                     y="title", 
+                     orientation='h', 
+                     title=f"상위 {limit}개 콘텐츠의 재생 시작 횟수", 
+                     labels={"total_plays": "총 재생 시작 횟수", "title": "콘텐츠 제목"},
+                     text='total_plays')
+        fig.update_layout(yaxis={'categoryorder':'total ascending'})
+        st.plotly_chart(fig, use_container_width=True)
+        
+        with st.expander("상세 데이터 보기"):
+            st.dataframe(df_played)
+    else:
+        st.warning("표시할 재생 데이터가 없습니다.")
+
+# 4. 추천 클릭이 많은 콘텐츠 탭
+with tab4:
+    st.header("🖱️ 추천 클릭이 많은 콘텐츠")
+    st.markdown("추천 목록을 통해 사용자들이 가장 많이 **클릭**한 콘텐츠입니다.")
+    with st.spinner("데이터 로딩 중..."):
+        df_recom = fetch_analytics_data("analytics/top-recommended-clicks", limit)
+    
+    if not df_recom.empty:
+        fig = px.bar(df_recom, 
+                     x="total_recom_clicks", 
+                     y="title", 
+                     orientation='h', 
+                     title=f"상위 {limit}개 콘텐츠의 추천 클릭 수", 
+                     labels={"total_recom_clicks": "총 추천 클릭 수", "title": "콘텐츠 제목"},
+                     text='total_recom_clicks')
+        fig.update_layout(yaxis={'categoryorder':'total ascending'})
+        st.plotly_chart(fig, use_container_width=True)
+        
+        with st.expander("상세 데이터 보기"):
+            st.dataframe(df_recom)
+    else:
+        st.warning("표시할 추천 클릭 데이터가 없습니다.")
+
+# 5. 종합 클릭이 많은 콘텐츠 탭 (기존)
+with tab5:
+    st.header("💥 종합 클릭이 많은 콘텐츠 (기존)")
+    st.markdown("단순 **콘텐츠 클릭(content_click)** 횟수가 가장 많은 콘텐츠입니다.")
+    with st.spinner("데이터 로딩 중..."):
+        df_clicks = fetch_analytics_data("analytics/top-clicks", limit)
+    
+    if not df_clicks.empty:
+        fig = px.bar(df_clicks, 
+                     x="total_clicks", 
+                     y="title", 
+                     orientation='h', 
+                     title=f"상위 {limit}개 콘텐츠의 종합 클릭 수", 
+                     labels={"total_clicks": "총 클릭 수", "title": "콘텐츠 제목"},
+                     text='total_clicks')
+        fig.update_layout(yaxis={'categoryorder':'total ascending'})
+        st.plotly_chart(fig, use_container_width=True)
+        
+        with st.expander("상세 데이터 보기"):
+            st.dataframe(df_clicks)
+    else:
+        st.warning("표시할 종합 클릭 데이터가 없습니다.")
+
+# 6. 원본 로그 데이터 조회 탭
+with tab6:
+    st.header("📜 원본 로그 데이터 조회 (`user_logs`)")
+    st.markdown("가공되지 않은 원본 `user_logs` 테이블의 데이터를 직접 조회합니다. 데이터 양이 많을 수 있으므로 필터 사용을 권장합니다.")
+
+    with st.form("log_filter_form"):
+        st.write("##### 🔍 데이터 필터링")
+        where_input = st.text_input(
+            "WHERE 절 입력",
+            placeholder="예: eventType = 'like_click' AND rating > 3"
+        )
+        submitted = st.form_submit_button("로그 데이터 조회")
+
+    if submitted:
+        with st.spinner("원본 로그 데이터 로딩 중..."):
+            df_logs = fetch_raw_log_data(limit, where_input)
+        
+        if not df_logs.empty:
+            st.success(f"**{len(df_logs)}개**의 로그 데이터를 조회했습니다.")
+            st.dataframe(df_logs)
+        else:
+            st.warning("조건에 맞는 로그 데이터가 없거나 조회에 실패했습니다.")

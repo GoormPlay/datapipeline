@@ -29,8 +29,8 @@ from confluent_kafka.schema_registry.avro import AvroSerializer, AvroDeserialize
 
 from utils.slack_fail_noti import task_fail_slack_alert
 
-kafka_cluster = '3.38.160.234:9092,43.202.111.59:9092,43.202.163.215:9092'
-SCHEMA_REGISTRY_URL = 'http://3.38.160.234:8081' # Schema Registry URL
+kafka_cluster = '15.165.7.37:9092,3.35.6.38:9092,3.38.200.113:9092'
+SCHEMA_REGISTRY_URL = 'http://15.165.7.37:8081' # Schema Registry URL
 KAFKA_TOPIC_AVRO = 'userlog-avro-topic'         # Avro 메시지를 위한 Kafka 토픽
 
 # Avro 스키마 정의 (make_event 함수 구조 기반)

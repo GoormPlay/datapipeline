@@ -18,8 +18,6 @@ except ImportError:
 from botocore.exceptions import ClientError
 from confluent_kafka.schema_registry.schema_registry_client import SchemaRegistryClient
 
-
-
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
@@ -150,6 +148,107 @@ def upsert_video_clicks_batch(batch_df, batch_id, video_clicks_summary_table_nam
         # 사용한 임시 뷰 삭제
         spark.catalog.dropTempView(temp_view_name)
 
+### 신규 집계 테이블을 위한 UPSERT 함수 ###
+
+def upsert_user_interest_batch(batch_df, batch_id, table_name):
+    """사용자 관심도 집계 테이블에 upsert"""
+    if batch_df.isEmpty():
+        logger.info(f"🔄 배치 {batch_id}: 데이터 없음, 처리 건너뜀 (대상 테이블: {table_name})")
+        return
+    
+    logger.info(f"🔄 배치 {batch_id}: {batch_df.count()} 레코드 처리 시작 (대상 테이블: {table_name})")
+    temp_view_name = f"updates_view_interest_{str(batch_id)}"
+    batch_df.createOrReplaceTempView(temp_view_name)
+    
+    spark = batch_df.sparkSession
+    
+    merge_sql = f"""
+    MERGE INTO {table_name} t
+    USING {temp_view_name} s
+    ON t.window_start = s.window_start AND t.userId = s.userId AND t.videoId = s.videoId
+    WHEN MATCHED THEN
+      UPDATE SET t.window_end = s.window_end, t.title = s.title, t.total_interest_score = s.total_interest_score
+    WHEN NOT MATCHED THEN
+      INSERT (window_start, window_end, userId, videoId, title, total_interest_score)
+      VALUES (s.window_start, s.window_end, s.userId, s.videoId, s.title, s.total_interest_score)
+    """
+    logger.debug(f"실행할 MERGE SQL (배치 {batch_id}):\n{merge_sql}")
+    
+    try:
+        spark.sql(merge_sql)
+        logger.info(f"✅ 배치 {batch_id}: 처리 완료 (대상 테이블: {table_name})")
+    except Exception as e:
+        logger.error(f"❌ 배치 {batch_id} 처리 실패 (테이블: {table_name}): {str(e)}")
+        raise
+    finally:
+        spark.catalog.dropTempView(temp_view_name)
+
+def upsert_play_summary_batch(batch_df, batch_id, table_name):
+    """콘텐츠 재생 집계 테이블에 upsert"""
+    if batch_df.isEmpty():
+        logger.info(f"🔄 배치 {batch_id}: 데이터 없음, 처리 건너뜀 (대상 테이블: {table_name})")
+        return
+    
+    logger.info(f"🔄 배치 {batch_id}: {batch_df.count()} 레코드 처리 시작 (대상 테이블: {table_name})")
+    temp_view_name = f"updates_view_play_{str(batch_id)}"
+    batch_df.createOrReplaceTempView(temp_view_name)
+    
+    spark = batch_df.sparkSession
+    
+    merge_sql = f"""
+    MERGE INTO {table_name} t
+    USING {temp_view_name} s
+    ON t.window_start = s.window_start AND t.videoId = s.videoId
+    WHEN MATCHED THEN
+      UPDATE SET t.window_end = s.window_end, t.title = s.title, t.play_start_count = s.play_start_count
+    WHEN NOT MATCHED THEN
+      INSERT (window_start, window_end, videoId, title, play_start_count)
+      VALUES (s.window_start, s.window_end, s.videoId, s.title, s.play_start_count)
+    """
+    logger.debug(f"실행할 MERGE SQL (배치 {batch_id}):\n{merge_sql}")
+    
+    try:
+        spark.sql(merge_sql)
+        logger.info(f"✅ 배치 {batch_id}: 처리 완료 (대상 테이블: {table_name})")
+    except Exception as e:
+        logger.error(f"❌ 배치 {batch_id} 처리 실패 (테이블: {table_name}): {str(e)}")
+        raise
+    finally:
+        spark.catalog.dropTempView(temp_view_name)
+
+def upsert_recom_clicks_batch(batch_df, batch_id, table_name):
+    """추천 클릭 집계 테이블에 upsert"""
+    if batch_df.isEmpty():
+        logger.info(f"🔄 배치 {batch_id}: 데이터 없음, 처리 건너뜀 (대상 테이블: {table_name})")
+        return
+    
+    logger.info(f"🔄 배치 {batch_id}: {batch_df.count()} 레코드 처리 시작 (대상 테이블: {table_name})")
+    temp_view_name = f"updates_view_recom_{str(batch_id)}"
+    batch_df.createOrReplaceTempView(temp_view_name)
+    
+    spark = batch_df.sparkSession
+    
+    merge_sql = f"""
+    MERGE INTO {table_name} t
+    USING {temp_view_name} s
+    ON t.window_start = s.window_start AND t.videoId = s.videoId
+    WHEN MATCHED THEN
+      UPDATE SET t.window_end = s.window_end, t.title = s.title, t.recom_click_count = s.recom_click_count
+    WHEN NOT MATCHED THEN
+      INSERT (window_start, window_end, videoId, title, recom_click_count)
+      VALUES (s.window_start, s.window_end, s.videoId, s.title, s.recom_click_count)
+    """
+    logger.debug(f"실행할 MERGE SQL (배치 {batch_id}):\n{merge_sql}")
+    
+    try:
+        spark.sql(merge_sql)
+        logger.info(f"✅ 배치 {batch_id}: 처리 완료 (대상 테이블: {table_name})")
+    except Exception as e:
+        logger.error(f"❌ 배치 {batch_id} 처리 실패 (테이블: {table_name}): {str(e)}")
+        raise
+    finally:
+        spark.catalog.dropTempView(temp_view_name)
+
 ### MAIN ###
 
 def main():
@@ -264,6 +363,9 @@ def main():
         # Iceberg 테이블 이름 정의
         raw_data_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.{args.iceberg_table_name}"
         video_clicks_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.video_clicks_summary"
+        user_interest_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.user_content_interest_summary"
+        content_play_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.content_play_summary"
+        recom_click_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.recommendation_click_summary"
 
         # 데이터베이스가 존재하지 않으면 생성
         logger.info(f"Ensuring database {args.iceberg_catalog_name}.{args.iceberg_db_name} exists...")
@@ -393,6 +495,55 @@ def main():
         spark.catalog.refreshTable(video_clicks_summary_table)
         logger.info(f"Refreshed catalog for table {video_clicks_summary_table}")
 
+        # 3. user_content_interest_summary 테이블 생성 (존재하지 않을 경우)
+        user_interest_ddl = f"""
+        CREATE TABLE IF NOT EXISTS {user_interest_summary_table} (
+            window_start TIMESTAMP,
+            window_end TIMESTAMP,
+            userId STRING,
+            videoId STRING,
+            title STRING,
+            total_interest_score LONG
+        )
+        USING iceberg
+        PARTITIONED BY (hours(window_start))
+        """
+        logger.info(f"Ensuring table {user_interest_summary_table} exists...")
+        spark.sql(user_interest_ddl)
+        logger.info(f"Table {user_interest_summary_table} ensured.")
+
+        # 4. content_play_summary 테이블 생성 (존재하지 않을 경우)
+        content_play_ddl = f"""
+        CREATE TABLE IF NOT EXISTS {content_play_summary_table} (
+            window_start TIMESTAMP,
+            window_end TIMESTAMP,
+            videoId STRING,
+            title STRING,
+            play_start_count LONG
+        )
+        USING iceberg
+        PARTITIONED BY (hours(window_start))
+        """
+        logger.info(f"Ensuring table {content_play_summary_table} exists...")
+        spark.sql(content_play_ddl)
+        logger.info(f"Table {content_play_summary_table} ensured.")
+
+        # 5. recommendation_click_summary 테이블 생성 (존재하지 않을 경우)
+        recom_click_ddl = f"""
+        CREATE TABLE IF NOT EXISTS {recom_click_summary_table} (
+            window_start TIMESTAMP,
+            window_end TIMESTAMP,
+            videoId STRING,
+            title STRING,
+            recom_click_count LONG
+        )
+        USING iceberg
+        PARTITIONED BY (hours(window_start))
+        """
+        logger.info(f"Ensuring table {recom_click_summary_table} exists...")
+        spark.sql(recom_click_ddl)
+        logger.info(f"Table {recom_click_summary_table} ensured.")
+
 
         # 1. 원본 데이터를 Iceberg user_logs 테이블에 저장 (느슨한 결합)
         raw_data_to_iceberg_query = None
@@ -473,6 +624,113 @@ def main():
             # 이 오류는 치명적이지 않을 수 있으므로 원본 데이터 스트림은 유지
             logger.warning("비디오 클릭 집계 스트림은 시작되지 않았지만, 원본 데이터 스트림은 계속됩니다.")
 
+        # 3. 사용자 콘텐츠 관심도 집계
+        user_interest_query = None
+        try:
+            if "event_timestamp" in df_with_event_timestamp.columns:
+                logger.info("사용자 콘텐츠 관심도 집계를 시작합니다.")
+                interest_events_df = df_with_event_timestamp.filter(
+                    col("eventType").isin("like_click", "content_click", "review_write", "rating_submit", "play_start")
+                )
+
+                interest_score_df = interest_events_df.withColumn("interest_score",
+                    func.when(col("eventType") == "like_click", 5)
+                        .when(col("eventType") == "review_write", 10)
+                        .when(col("eventType") == "rating_submit", col("rating") * 2) # 1-5점 -> 2-10점
+                        .when(col("eventType") == "play_start", 2)
+                        .when(col("eventType") == "content_click", 1)
+                        .otherwise(0)
+                )
+
+                user_interest_summary_df = interest_score_df \
+                    .withWatermark("event_timestamp", "5 minutes") \
+                    .groupBy(
+                        window(col("event_timestamp"), "30 minutes").alias("time_window"),
+                        col("userId"),
+                        col("videoId"),
+                        col("title")
+                    ) \
+                    .agg(func.sum("interest_score").alias("total_interest_score")) \
+                    .select(
+                        col("time_window.start").alias("window_start"),
+                        col("time_window.end").alias("window_end"),
+                        col("userId"),
+                        col("videoId"),
+                        col("title"),
+                        col("total_interest_score")
+                    )
+
+                user_interest_query = user_interest_summary_df.writeStream \
+                    .foreachBatch(lambda df_batch, batch_id: upsert_user_interest_batch(df_batch, batch_id, user_interest_summary_table)) \
+                    .option("checkpointLocation", f"{args.checkpoint_location}/user_interest_summary") \
+                    .outputMode("update") \
+                    .trigger(processingTime=args.processing_time_trigger) \
+                    .start()
+                logger.info(f"Iceberg '{user_interest_summary_table}' 테이블 저장 스트림 정의 완료")
+                active_queries.append(user_interest_query)
+        except Exception as e:
+            logger.error(f"사용자 관심도 집계 설정 중 오류: {str(e)}")
+
+        # 4. 콘텐츠 재생 시작 집계 (재생 시간 대신 재생 시작 횟수 집계)
+        # 참고: 정확한 재생 시간 계산은 `mapGroupsWithState`와 같은 고급 상태 저장 스트리밍 연산이 필요하여 복잡합니다.
+        #       재생 시작 횟수는 사용자 참여도를 측정하는 강력하고 간단한 대안입니다.
+        play_summary_query = None
+        try:
+            if "event_timestamp" in df_with_event_timestamp.columns:
+                logger.info("콘텐츠 재생 시작 횟수 집계를 시작합니다.")
+                play_start_df = df_with_event_timestamp.filter(col("eventType") == "play_start")
+
+                content_play_summary_df = play_start_df \
+                    .withWatermark("event_timestamp", "5 minutes") \
+                    .groupBy(
+                        window(col("event_timestamp"), "30 minutes").alias("time_window"),
+                        col("videoId"),
+                        col("title")
+                    ) \
+                    .agg(func.count("*").alias("play_start_count")) \
+                    .select(
+                        col("time_window.start").alias("window_start"),
+                        col("time_window.end").alias("window_end"),
+                        col("videoId"),
+                        col("title"),
+                        col("play_start_count")
+                    )
+
+                play_summary_query = content_play_summary_df.writeStream \
+                    .foreachBatch(lambda df_batch, batch_id: upsert_play_summary_batch(df_batch, batch_id, content_play_summary_table)) \
+                    .option("checkpointLocation", f"{args.checkpoint_location}/content_play_summary") \
+                    .outputMode("update") \
+                    .trigger(processingTime=args.processing_time_trigger) \
+                    .start()
+                logger.info(f"Iceberg '{content_play_summary_table}' 테이블 저장 스트림 정의 완료")
+                active_queries.append(play_summary_query)
+        except Exception as e:
+            logger.error(f"콘텐츠 재생 집계 설정 중 오류: {str(e)}")
+
+        # 5. 추천 콘텐츠 클릭 집계
+        recom_click_query = None
+        try:
+            if "event_timestamp" in df_with_event_timestamp.columns:
+                logger.info("추천 콘텐츠 클릭 집계를 시작합니다.")
+                recom_click_df = df_with_event_timestamp.filter(col("eventType") == "content_recom_click")
+
+                recommendation_click_summary_df = recom_click_df \
+                    .withWatermark("event_timestamp", "5 minutes") \
+                    .groupBy(window(col("event_timestamp"), "30 minutes").alias("time_window"), col("videoId"), col("title")) \
+                    .agg(func.count("*").alias("recom_click_count")) \
+                    .select(col("time_window.start").alias("window_start"), col("time_window.end").alias("window_end"), col("videoId"), col("title"), col("recom_click_count"))
+
+                recom_click_query = recommendation_click_summary_df.writeStream \
+                    .foreachBatch(lambda df_batch, batch_id: upsert_recom_clicks_batch(df_batch, batch_id, recom_click_summary_table)) \
+                    .option("checkpointLocation", f"{args.checkpoint_location}/recom_click_summary") \
+                    .outputMode("update") \
+                    .trigger(processingTime=args.processing_time_trigger) \
+                    .start()
+                logger.info(f"Iceberg '{recom_click_summary_table}' 테이블 저장 스트림 정의 완료")
+                active_queries.append(recom_click_query)
+        except Exception as e:
+            logger.error(f"추천 클릭 집계 설정 중 오류: {str(e)}")
+
         # 모든 쿼리가 종료될 때까지 대기
         if active_queries:
             logger.info(f"{len(active_queries)}개의 활성 스트림 쿼리가 실행 중입니다. 종료 대기 중...")
@@ -529,3 +787,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ./run_spark_job.py --job streaming_iceberg_table.py

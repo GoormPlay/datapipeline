@@ -26,8 +26,7 @@ except ImportError:
 # 기본 설정
 kafka_cluster = '15.165.7.37:9092,3.35.6.38:9092,3.38.200.113:9092'
 SCHEMA_REGISTRY_URL = 'http://15.165.7.37:8081'
-KAFKA_TOPIC_AVRO = 'userlog-avro-benchmark'  # 벤치마크용 토픽
-
+KAFKA_TOPIC_AVRO = 'userlog-avro-benchmark' # 벤치마크용 토픽
 # Avro 스키마 정의
 AVRO_SCHEMA_STRING = """
 {

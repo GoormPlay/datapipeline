@@ -23,8 +23,8 @@ except ImportError:
 
 from utils.slack_fail_noti import task_fail_slack_alert
 
-kafka_cluster = '15.164.236.86:9092,3.35.5.47:9092,43.203.112.201:9092'
-SCHEMA_REGISTRY_URL = 'http://15.164.236.86:8081' # Schema Registry URL
+kafka_cluster = '15.165.7.37:9092,3.35.6.38:9092,3.38.200.113:9092'
+SCHEMA_REGISTRY_URL = 'http://15.165.7.37:8081' # Schema Registry URL
 KAFKA_TOPIC_AVRO = 'userlog-avro-topic'         # Avro 메시지를 위한 Kafka 토픽
 
 # Avro 스키마 정의 (make_event 함수 구조 기반)
@@ -67,6 +67,10 @@ def generate_event_avro(**kwargs):
         'schema.registry.url': SCHEMA_REGISTRY_URL,
         'retries': 10,
         'linger.ms': 200,
+        'enable.idempotence': True,
+        'acks': 'all',
+        'max.in.flight.requests.per.connection': 5,
+        'compression.type': 'snappy',
     }
 
     avro_producer = AvroProducer(
@@ -99,7 +103,7 @@ def generate_event_avro(**kwargs):
     num_events = 1_00_000  # 필요한 양으로 조절 가능
     # num_events = 1000 # 테스트용
 
-    event_types = ["like_click", "content_click", "review_write", "rating_submit", "paly_start", "paly_stop", "content_recom_click"]
+    event_types = ["like_click", "content_click", "review_write", "rating_submit", "play_start", "play_stop", "content_recom_click"]
 
     def make_event_payload(): # 함수명 변경하여 명확화
         # Avro 스키마에 정의된 모든 필드를 초기에 None으로 설정 (userId, timestamp 등은 아래에서 덮어쓰여짐)
@@ -147,11 +151,16 @@ def generate_event_avro(**kwargs):
             event["page"] = "content_detail"
         elif event["eventType"] == "content_recom_click":
             event["page"] = "content_detail"
-            event["recMovieList"] = fake.sentence()
-        elif event["eventType"] == "paly_start":
-            event["page"] = "content_paly"
-        elif event["eventType"] == "paly_stop":
-            event["page"] = "content_paly"
+            if mongo_contents_data:
+                recommended_titles = [random.choice(mongo_contents_data).get("title", "") for _ in range(random.randint(2, 3))]
+                # None 값을 필터링하고, 유효한 타이틀만 join 합니다.
+                event["recMovieList"] = ", ".join(filter(None, recommended_titles))
+            else:
+                event["recMovieList"] = None
+        elif event["eventType"] == "play_start":
+            event["page"] = "content_play"
+        elif event["eventType"] == "play_stop":
+            event["page"] = "content_play"
 
         # 다른 eventType의 경우, 해당 특정 필드들은 None으로 유지됨
         return event

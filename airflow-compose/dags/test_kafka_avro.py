@@ -221,7 +221,7 @@ def generate_event_avro(**kwargs):
 
 
 with DAG(
-    'generate_dummy_avro', # DAG ID 변경
+    'generate', # DAG ID 변경
     default_args={
         'depends_on_past':False,
         'retries':1, # 대량 데이터 생성 실패 시 재시도 부담 줄임

@@ -1,10 +1,13 @@
 import os
 from typing import Dict, List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from dotenv import load_dotenv
 import pandas as pd
 import traceback
 import time
+from datetime import datetime, timedelta
+# PySpark 함수 및 타입 임포트
+from pyspark.sql.functions import col, sum as _sum
 
 # macOS에서의 fork 안전성 경고 해결
 os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
@@ -12,7 +15,10 @@ os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
 # 환경 변수 로드
 load_dotenv()
 
-app = FastAPI(title="Simple Iceberg Table API", description="REST API for querying Iceberg tables")
+app = FastAPI(
+    title="Iceberg Analytics API",
+    description="REST API for querying Iceberg tables, including analytics summaries."
+)
 
 # 글로벌 SparkSession
 spark = None
@@ -41,8 +47,8 @@ def get_spark():
             .config(f"spark.sql.catalog.{os.getenv('ICEBERG_CATALOG_NAME', 'userlogs_catalog')}.type", "hadoop") \
             .config(f"spark.sql.catalog.{os.getenv('ICEBERG_CATALOG_NAME', 'userlogs_catalog')}.warehouse", os.getenv("ICEBERG_WAREHOUSE", "s3a://userlog-data/warehouse")) \
             .config("spark.hadoop.fs.s3a.endpoint", os.getenv("S3_ENDPOINT", "http://54.180.166.228:9000")) \
-            .config("spark.hadoop.fs.s3a.access.key", os.getenv("S3_ACCESS_KEY", "qpJ3MNpmCtpMQw26BURO")) \
-            .config("spark.hadoop.fs.s3a.secret.key", os.getenv("S3_SECRET_KEY", "xhrkNGpcVVozn8sAgI7xPsoTfqUxZJgOTwko4DRd")) \
+            .config("spark.hadoop.fs.s3a.access.key", os.getenv("S3_ACCESS_KEY", "LlZ4WcgdiQUlgizykTR0")) \
+            .config("spark.hadoop.fs.s3a.secret.key", os.getenv("S3_SECRET_KEY", "oUw1wYr2hvX3J5jupm5ytWc93HfOydGseLZejX9U")) \
             .config("spark.haddop.fs.s3a.region", os.getenv("S3_REGION", "ap-northeast-2")) \
             .config("spark.hadoop.fs.s3a.path.style.access", "true") \
             .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
@@ -101,6 +107,118 @@ def list_databases():
             }
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc()}
+
+# --- Analytics Endpoints ---
+
+def refresh_and_get_data(table_name: str, group_by_cols: List[str], agg_col: str, agg_alias: str, limit: int):
+    """Helper function to refresh table, query, and return data."""
+    try:
+        spark = get_spark()
+        catalog_name = os.getenv('ICEBERG_CATALOG_NAME', 'userlogs_catalog')
+        db_name = "analytics"
+        full_table_name = f"{catalog_name}.{db_name}.`{table_name}`"
+
+        # 테이블 메타데이터 새로고침
+        try:
+            spark.catalog.refreshTable(full_table_name)
+            print(f"Refreshed table: {full_table_name}")
+        except Exception as refresh_error:
+            # 테이블이 아직 생성되지 않았을 수 있으므로 경고만 로깅
+            print(f"Warning: Could not refresh table {full_table_name}. It might not exist yet. Error: {refresh_error}")
+
+        df = spark.read.table(full_table_name)
+        
+        result_df = df.groupBy(*group_by_cols) \
+                      .agg(_sum(agg_col).alias(agg_alias)) \
+                      .orderBy(col(agg_alias).desc()) \
+                      .limit(limit)
+                      
+        # FastAPI가 JSON으로 자동 변환하므로 to_dict() 사용
+        return result_df.toPandas().to_dict(orient='records')
+
+    except Exception as e:
+        traceback.print_exc()
+        # PySpark 오류 메시지가 더 유용할 수 있으므로 포함
+        if "AnalysisException" in str(e):
+            raise HTTPException(status_code=404, detail=f"Table or database not found. Check if '{db_name}.{table_name}' exists. Spark error: {e}")
+        raise HTTPException(status_code=500, detail=f"데이터 조회 실패: {str(e)}")
+
+
+@app.get("/analytics/user-interest", summary="사용자별 콘텐츠 관심도 TOP N", tags=["Analytics"])
+def get_user_interest(limit: int = Query(10, ge=1, le=100)):
+    """
+    사용자별 콘텐츠 관심도 점수(좋아요, 리뷰, 평점 등)가 가장 높은 순으로 데이터를 반환합니다.
+    """
+    return refresh_and_get_data(
+        table_name="user_content_interest_summary",
+        group_by_cols=["userId", "videoId", "title"],
+        agg_col="total_interest_score",
+        agg_alias="total_score",
+        limit=limit
+    )
+
+@app.get("/analytics/top-played", summary="가장 많이 재생된 콘텐츠 TOP N", tags=["Analytics"])
+def get_top_played_content(limit: int = Query(10, ge=1, le=100)):
+    """
+    가장 많이 재생 시작된 콘텐츠 순으로 데이터를 반환합니다.
+    """
+    return refresh_and_get_data(
+        table_name="content_play_summary",
+        group_by_cols=["videoId", "title"],
+        agg_col="play_start_count",
+        agg_alias="total_plays",
+        limit=limit
+    )
+
+@app.get("/analytics/top-recommended-clicks", summary="추천 클릭이 많은 콘텐츠 TOP N", tags=["Analytics"])
+def get_top_recommendation_clicks(limit: int = Query(10, ge=1, le=100)):
+    """
+    추천을 통해 가장 많이 클릭된 콘텐츠 순으로 데이터를 반환합니다.
+    """
+    return refresh_and_get_data(
+        table_name="recommendation_click_summary",
+        group_by_cols=["videoId", "title"],
+        agg_col="recom_click_count",
+        agg_alias="total_recom_clicks",
+        limit=limit
+    )
+
+@app.get("/analytics/top-clicks", summary="단순 클릭이 많은 콘텐츠 TOP N (기존)", tags=["Analytics"])
+def get_top_clicks(limit: int = Query(10, ge=1, le=100)):
+    """(기존) 가장 많이 클릭된 콘텐츠(content_click) 순으로 데이터를 반환합니다."""
+    return refresh_and_get_data(
+        table_name="video_clicks_summary",
+        group_by_cols=["videoId", "title"],
+        agg_col="click_count",
+        agg_alias="total_clicks",
+        limit=limit
+    )
+
+@app.get("/analytics/recent-user-interest", summary="최근 N분간의 사용자 관심도", tags=["Analytics"])
+def get_recent_user_interest(
+    minutes_ago: int = Query(30, ge=1, le=1440, description="조회할 최근 시간(분)"),
+    limit: int = Query(10, ge=1, le=100)
+):
+    """
+    지정된 시간(기본 30분) 내에 발생한 사용자 관심도 데이터를 집계하여 반환합니다.
+    """
+    try:
+        spark = get_spark()
+        table_name = f"{os.getenv('ICEBERG_CATALOG_NAME', 'userlogs_catalog')}.analytics.user_content_interest_summary"
+        
+        # 시간 필터링 조건 생성
+        time_threshold = datetime.utcnow() - timedelta(minutes=minutes_ago)
+        time_threshold_str = time_threshold.strftime('%Y-%m-%d %H:%M:%S')
+
+        df = spark.read.table(table_name)
+        
+        result_df = df.filter(col("window_start") >= time_threshold_str) \
+                      .groupBy("userId", "videoId", "title") \
+                      .agg(_sum("total_interest_score").alias("recent_score")) \
+                      .orderBy(col("recent_score").desc()).limit(limit)
+        return result_df.toPandas().to_dict(orient='records')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"최근 관심도 데이터 조회 실패: {str(e)}")
 
 @app.get("/tables")
 def list_tables(database: str = "analytics"):
