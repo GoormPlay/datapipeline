@@ -214,11 +214,96 @@ def get_recent_user_interest(
         
         result_df = df.filter(col("window_start") >= time_threshold_str) \
                       .groupBy("userId", "videoId", "title") \
-                      .agg(_sum("total_interest_score").alias("recent_score")) \
+                      .agg(
+                          _sum("total_interest_score").alias("recent_score"),
+                          _sum("total_interest_score").alias("total_score") # For consistency with existing user-interest
+                      ) \
                       .orderBy(col("recent_score").desc()).limit(limit)
         return result_df.toPandas().to_dict(orient='records')
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"최근 관심도 데이터 조회 실패: {str(e)}")
+
+def _get_recent_summary_data(
+    table_name: str,
+    group_by_cols: List[str],
+    agg_col: str,
+    agg_alias: str,
+    minutes_ago: int,
+    limit: int
+):
+    """Helper function to get recent aggregated data from summary tables."""
+    try:
+        spark = get_spark()
+        full_table_name = f"{os.getenv('ICEBERG_CATALOG_NAME', 'userlogs_catalog')}.analytics.{table_name}"
+        
+        # 시간 필터링 조건 생성
+        time_threshold = datetime.utcnow() - timedelta(minutes=minutes_ago)
+        time_threshold_str = time_threshold.strftime('%Y-%m-%d %H:%M:%S')
+
+        df = spark.read.table(full_table_name)
+        
+        result_df = df.filter(col("window_start") >= time_threshold_str) \
+                      .groupBy(*group_by_cols) \
+                      .agg(_sum(agg_col).alias(agg_alias)) \
+                      .orderBy(col(agg_alias).desc()).limit(limit)
+        return result_df.toPandas().to_dict(orient='records')
+    except Exception as e:
+        # Let the calling endpoint handle the HTTPException
+        raise e
+
+@app.get("/analytics/recent-top-played", summary="최근 N분간 가장 많이 재생된 콘텐츠", tags=["Analytics"])
+def get_recent_top_played(
+    minutes_ago: int = Query(30, ge=1, le=1440, description="조회할 최근 시간(분)"),
+    limit: int = Query(10, ge=1, le=100)
+):
+    """지정된 시간 내에 가장 많이 재생 시작된 콘텐츠 순으로 데이터를 반환합니다."""
+    try:
+        return _get_recent_summary_data(
+            table_name="content_play_summary",
+            group_by_cols=["videoId", "title"],
+            agg_col="play_start_count",
+            agg_alias="recent_plays",
+            minutes_ago=minutes_ago,
+            limit=limit
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"최근 재생 데이터 조회 실패: {str(e)}")
+
+@app.get("/analytics/recent-top-recommended-clicks", summary="최근 N분간 추천 클릭이 많은 콘텐츠", tags=["Analytics"])
+def get_recent_top_recommended_clicks(
+    minutes_ago: int = Query(30, ge=1, le=1440, description="조회할 최근 시간(분)"),
+    limit: int = Query(10, ge=1, le=100)
+):
+    """지정된 시간 내에 추천을 통해 가장 많이 클릭된 콘텐츠 순으로 데이터를 반환합니다."""
+    try:
+        return _get_recent_summary_data(
+            table_name="recommendation_click_summary",
+            group_by_cols=["videoId", "title"],
+            agg_col="recom_click_count",
+            agg_alias="recent_recom_clicks",
+            minutes_ago=minutes_ago,
+            limit=limit
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"최근 추천 클릭 데이터 조회 실패: {str(e)}")
+
+@app.get("/analytics/recent-top-clicks", summary="최근 N분간 단순 클릭이 많은 콘텐츠", tags=["Analytics"])
+def get_recent_top_clicks(
+    minutes_ago: int = Query(30, ge=1, le=1440, description="조회할 최근 시간(분)"),
+    limit: int = Query(10, ge=1, le=100)
+):
+    """(기존) 지정된 시간 내에 가장 많이 클릭된 콘텐츠(content_click) 순으로 데이터를 반환합니다."""
+    try:
+        return _get_recent_summary_data(
+            table_name="video_clicks_summary",
+            group_by_cols=["videoId", "title"],
+            agg_col="click_count",
+            agg_alias="recent_clicks",
+            minutes_ago=minutes_ago,
+            limit=limit
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"최근 종합 클릭 데이터 조회 실패: {str(e)}")
 
 @app.get("/tables")
 def list_tables(database: str = "analytics"):

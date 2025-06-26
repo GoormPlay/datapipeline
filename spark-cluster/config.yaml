@@ -13,12 +13,12 @@ spark:
 
 # Schema Registry
 schema_registry:
-  url: "http://15.165.7.37:8081"
+  url: "http://3.37.28.112:8081"
   subject: "userlog-avro-topic-value"
 
 # Kafka
 kafka:
-  brokers: "15.165.7.37:9092,3.35.6.38:9092,3.38.200.113:9092"
+  brokers: "3.37.28.112:9092,3.34.254.230:9092,3.38.175.84:9092"
   topic: "userlog-avro-topic"
 
 # Iceberg

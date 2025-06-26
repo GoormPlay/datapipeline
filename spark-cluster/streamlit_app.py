@@ -47,7 +47,7 @@ def fetch_recent_data(endpoint: str, minutes: int, limit: int):
         return pd.DataFrame()
 
 @st.cache_data(ttl=60)
-def fetch_raw_log_data(limit: int, where_clause: str = ""):
+def fetch_raw_log_data(limit: int, where_clause: str = "", database: str = "analytics", table: str = "user_logs"):
     """/table-data 엔드포인트에서 user_logs 데이터를 가져옵니다."""
     try:
         url = f"{API_BASE_URL}/table-data"
@@ -55,8 +55,8 @@ def fetch_raw_log_data(limit: int, where_clause: str = ""):
         params = {
             "database": "analytics",
             "table": "user_logs",
-            "limit": limit,
         }
+        params["limit"] = limit # Ensure limit is always passed
         if where_clause:
             params["where_clause"] = where_clause
 
@@ -84,133 +84,221 @@ with st.sidebar:
         st.rerun()
 
 # 탭 생성
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3 = st.tabs([
     "🕒 실시간 활동",
-    "📈 사용자 관심도", 
-    "▶️ 인기 재생", 
-    "🖱️ 인기 추천",
-    "💥 종합 클릭 (기존)",
+    "📊 종합 분석", 
     "📜 원본 로그 조회"
 ])
 
 # 1. 실시간 활동 탭 (신규)
 with tab1:
     st.header("🕒 실시간 활동 (최근 30분)")
-    st.markdown("최근 30분 동안 집계된 사용자 관심도 순위입니다. 현재 가장 '핫'한 콘텐츠를 보여줍니다.")
-    with st.spinner("최근 활동 데이터 로딩 중..."):
-        df_recent = fetch_recent_data("analytics/recent-user-interest", minutes=30, limit=limit)
+    st.markdown("최근 30분 동안 집계된 사용자 행동 데이터입니다. 현재 가장 '핫'한 콘텐츠를 보여줍니다.")
     
-    if not df_recent.empty:
-        fig = px.bar(df_recent, 
-                     x="recent_score", 
-                     y="title", 
-                     orientation='h', 
-                     title=f"최근 30분간 사용자 관심도 TOP {limit}", 
-                     labels={"recent_score": "최근 관심도 점수", "title": "콘텐츠 제목"},
-                     text='recent_score')
-        fig.update_layout(yaxis={'categoryorder':'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
+    # 1.1 사용자 관심도 (최근 30분)
+    with st.container(border=True):
+        st.subheader("💖 사용자 관심도 (최근 30분)")
+        with st.spinner("최근 관심도 데이터 로딩 중..."):
+            df_recent_interest = fetch_recent_data("analytics/recent-user-interest", minutes=30, limit=limit)
         
-        with st.expander("상세 데이터 보기"):
-            st.dataframe(df_recent)
-    else:
-        st.info("최근 30분 내에 집계된 데이터가 없습니다.")
+        if not df_recent_interest.empty:
+            fig = px.bar(df_recent_interest, 
+                         x="recent_score", 
+                         y="title",
+                         orientation='h', 
+                         title=f"최근 30분간 사용자 관심도 TOP {limit}", 
+                         labels={"recent_score": "최근 관심도 점수", "title": "콘텐츠 제목"},
+                         text='recent_score',
+                         color='recent_score',
+                         color_continuous_scale=px.colors.sequential.Viridis)
+            fig.update_layout(yaxis={'categoryorder':'total ascending'}, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+    
+            with st.expander("상세 데이터 보기"):
+                st.dataframe(df_recent_interest, use_container_width=True)
+        else:
+            st.info("최근 30분 내에 집계된 관심도 데이터가 없습니다.", icon="ℹ️")
 
-# 2. 사용자 관심도 탭
+    st.divider()
+
+    # 1.2 가장 많이 재생된 콘텐츠 (최근 30분)
+    with st.container(border=True):
+        st.subheader("▶️ 가장 많이 재생된 콘텐츠 (최근 30분)")
+        with st.spinner("최근 재생 데이터 로딩 중..."):
+            df_recent_played = fetch_recent_data("analytics/recent-top-played", minutes=30, limit=limit)
+        
+        if not df_recent_played.empty:
+            fig = px.bar(df_recent_played, 
+                         x="recent_plays", 
+                         y="title",
+                         orientation='h', 
+                         title=f"최근 30분간 재생 시작 횟수 TOP {limit}", 
+                         labels={"recent_plays": "최근 재생 횟수", "title": "콘텐츠 제목"},
+                         text='recent_plays',
+                         color='recent_plays',
+                         color_continuous_scale=px.colors.sequential.Cividis)
+            fig.update_layout(yaxis={'categoryorder':'total ascending'}, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+    
+            with st.expander("상세 데이터 보기"):
+                st.dataframe(df_recent_played, use_container_width=True)
+        else:
+            st.info("최근 30분 내에 집계된 재생 데이터가 없습니다.", icon="ℹ️")
+
+    st.divider()
+
+    # 1.3 추천 클릭이 많은 콘텐츠 (최근 30분)
+    with st.container(border=True):
+        st.subheader("🖱️ 추천을 통해 많이 본 콘텐츠 (최근 30분)")
+        with st.spinner("최근 추천 클릭 데이터 로딩 중..."):
+            df_recent_recom = fetch_recent_data("analytics/recent-top-recommended-clicks", minutes=30, limit=limit)
+        
+        if not df_recent_recom.empty:
+            fig = px.bar(df_recent_recom, 
+                         x="recent_recom_clicks", 
+                         y="title",
+                         orientation='h', 
+                         title=f"최근 30분간 추천 클릭 수 TOP {limit}", 
+                         labels={"recent_recom_clicks": "최근 추천 클릭 수", "title": "콘텐츠 제목"},
+                         text='recent_recom_clicks',
+                         color='recent_recom_clicks',
+                         color_continuous_scale=px.colors.sequential.Inferno)
+            fig.update_layout(yaxis={'categoryorder':'total ascending'}, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+    
+            with st.expander("상세 데이터 보기"):
+                st.dataframe(df_recent_recom, use_container_width=True)
+        else:
+            st.info("최근 30분 내에 집계된 추천 클릭 데이터가 없습니다.", icon="ℹ️")
+
+    st.divider()
+
+    # 1.4 종합 클릭이 많은 콘텐츠 (최근 30분)
+    with st.container(border=True):
+        st.subheader("💥 종합 클릭이 많은 콘텐츠 (최근 30분)")
+        with st.spinner("최근 종합 클릭 데이터 로딩 중..."):
+            df_recent_clicks = fetch_recent_data("analytics/recent-top-clicks", minutes=30, limit=limit)
+        
+        if not df_recent_clicks.empty:
+            fig = px.bar(df_recent_clicks, 
+                         x="recent_clicks", 
+                         y="title",
+                         orientation='h', 
+                         title=f"최근 30분간 종합 클릭 수 TOP {limit}", 
+                         labels={"recent_clicks": "최근 종합 클릭 수", "title": "콘텐츠 제목"},
+                         text='recent_clicks',
+                         color='recent_clicks',
+                         color_continuous_scale=px.colors.sequential.Magma)
+            fig.update_layout(yaxis={'categoryorder':'total ascending'}, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+    
+            with st.expander("상세 데이터 보기"):
+                st.dataframe(df_recent_clicks, use_container_width=True)
+        else:
+            st.info("최근 30분 내에 집계된 종합 클릭 데이터가 없습니다.", icon="ℹ️")
+
+# 2. 종합 분석 탭 (기존 분석들을 여기에 통합)
 with tab2:
-    st.header("📈 사용자 관심도 높은 콘텐츠")
-    st.markdown("좋아요, 리뷰, 평점, 재생 시작 등을 종합하여 **사용자별 관심도 점수**가 가장 높은 콘텐츠입니다.")
-    with st.spinner("데이터 로딩 중..."):
-        df_interest = fetch_analytics_data("analytics/user-interest", limit)
-    
-    if not df_interest.empty:
-        # Plotly로 시각화 개선
-        fig = px.bar(df_interest, 
-                     x="total_score", 
-                     y="title", 
-                     orientation='h', 
-                     title=f"상위 {limit}개 콘텐츠의 사용자 관심도 점수", 
-                     labels={"total_score": "총 관심도 점수", "title": "콘텐츠 제목"},
-                     text='total_score')
-        fig.update_layout(yaxis={'categoryorder':'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-        
-        with st.expander("상세 데이터 보기"):
-            st.dataframe(df_interest)
-    else:
-        st.warning("표시할 사용자 관심도 데이터가 없습니다. Spark 스트리밍 작업이 실행 중인지 확인해주세요.")
+    st.header("📊 종합 분석 (누적 데이터)")
+    st.markdown("누적된 사용자 행동 데이터를 기반으로 한 다양한 분석 결과입니다.")
 
-# 3. 가장 많이 재생된 콘텐츠 탭
+    # 2.1 사용자 관심도 높은 콘텐츠
+    with st.container():
+        st.subheader("📈 사용자 관심도 높은 콘텐츠")
+        st.markdown("좋아요, 리뷰, 평점, 재생 시작 등을 종합하여 **사용자별 관심도 점수**가 가장 높은 콘텐츠입니다.")
+        with st.spinner("사용자 관심도 데이터 로딩 중..."):
+            df_interest = fetch_analytics_data("analytics/user-interest", limit)
+        
+        if not df_interest.empty:
+            fig = px.bar(df_interest, 
+                         x="total_score", 
+                         y="title", 
+                         orientation='h', 
+                         title=f"상위 {limit}개 콘텐츠의 사용자 관심도 점수", 
+                         labels={"total_score": "총 관심도 점수", "title": "콘텐츠 제목"},
+                         text='total_score')
+            fig.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig, use_container_width=True)
+            
+            with st.expander("상세 데이터 보기"):
+                st.dataframe(df_interest)
+        else:
+            st.warning("표시할 사용자 관심도 데이터가 없습니다. Spark 스트리밍 작업이 실행 중인지 확인해주세요.")
+    st.markdown("---") # 구분선
+
+    # 2.2 가장 많이 재생된 콘텐츠
+    with st.container():
+        st.subheader("▶️ 가장 많이 재생된 콘텐츠")
+        st.markdown("사용자들이 **재생 시작(play_start)** 버튼을 가장 많이 누른 콘텐츠입니다.")
+        with st.spinner("재생 데이터 로딩 중..."):
+            df_played = fetch_analytics_data("analytics/top-played", limit)
+        
+        if not df_played.empty:
+            fig = px.bar(df_played, 
+                         x="total_plays", 
+                         y="title", 
+                         orientation='h', 
+                         title=f"상위 {limit}개 콘텐츠의 재생 시작 횟수", 
+                         labels={"total_plays": "총 재생 시작 횟수", "title": "콘텐츠 제목"},
+                         text='total_plays')
+            fig.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig, use_container_width=True)
+            
+            with st.expander("상세 데이터 보기"):
+                st.dataframe(df_played)
+        else:
+            st.warning("표시할 재생 데이터가 없습니다.")
+    st.markdown("---") # 구분선
+
+    # 2.3 추천 클릭이 많은 콘텐츠
+    with st.container():
+        st.subheader("🖱️ 추천 클릭이 많은 콘텐츠")
+        st.markdown("추천 목록을 통해 사용자들이 가장 많이 **클릭**한 콘텐츠입니다.")
+        with st.spinner("추천 클릭 데이터 로딩 중..."):
+            df_recom = fetch_analytics_data("analytics/top-recommended-clicks", limit)
+        
+        if not df_recom.empty:
+            fig = px.bar(df_recom, 
+                         x="total_recom_clicks", 
+                         y="title", 
+                         orientation='h', 
+                         title=f"상위 {limit}개 콘텐츠의 추천 클릭 수", 
+                         labels={"total_recom_clicks": "총 추천 클릭 수", "title": "콘텐츠 제목"},
+                         text='total_recom_clicks')
+            fig.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig, use_container_width=True)
+            
+            with st.expander("상세 데이터 보기"):
+                st.dataframe(df_recom)
+        else:
+            st.warning("표시할 추천 클릭 데이터가 없습니다.")
+    st.markdown("---") # 구분선
+
+    # 2.4 종합 클릭이 많은 콘텐츠 (기존)
+    with st.container():
+        st.subheader("💥 종합 클릭이 많은 콘텐츠 (기존)")
+        st.markdown("단순 **콘텐츠 클릭(content_click)** 횟수가 가장 많은 콘텐츠입니다.")
+        with st.spinner("종합 클릭 데이터 로딩 중..."):
+            df_clicks = fetch_analytics_data("analytics/top-clicks", limit)
+        
+        if not df_clicks.empty:
+            fig = px.bar(df_clicks, 
+                         x="total_clicks", 
+                         y="title", 
+                         orientation='h', 
+                         title=f"상위 {limit}개 콘텐츠의 종합 클릭 수", 
+                         labels={"total_clicks": "총 클릭 수", "title": "콘텐츠 제목"},
+                         text='total_clicks')
+            fig.update_layout(yaxis={'categoryorder':'total ascending'})
+            st.plotly_chart(fig, use_container_width=True)
+            
+            with st.expander("상세 데이터 보기"):
+                st.dataframe(df_clicks)
+        else:
+            st.warning("표시할 종합 클릭 데이터가 없습니다.")
+
+# 3. 원본 로그 데이터 조회 탭
 with tab3:
-    st.header("▶️ 가장 많이 재생된 콘텐츠")
-    st.markdown("사용자들이 **재생 시작(play_start)** 버튼을 가장 많이 누른 콘텐츠입니다.")
-    with st.spinner("데이터 로딩 중..."):
-        df_played = fetch_analytics_data("analytics/top-played", limit)
-    
-    if not df_played.empty:
-        fig = px.bar(df_played, 
-                     x="total_plays", 
-                     y="title", 
-                     orientation='h', 
-                     title=f"상위 {limit}개 콘텐츠의 재생 시작 횟수", 
-                     labels={"total_plays": "총 재생 시작 횟수", "title": "콘텐츠 제목"},
-                     text='total_plays')
-        fig.update_layout(yaxis={'categoryorder':'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-        
-        with st.expander("상세 데이터 보기"):
-            st.dataframe(df_played)
-    else:
-        st.warning("표시할 재생 데이터가 없습니다.")
-
-# 4. 추천 클릭이 많은 콘텐츠 탭
-with tab4:
-    st.header("🖱️ 추천 클릭이 많은 콘텐츠")
-    st.markdown("추천 목록을 통해 사용자들이 가장 많이 **클릭**한 콘텐츠입니다.")
-    with st.spinner("데이터 로딩 중..."):
-        df_recom = fetch_analytics_data("analytics/top-recommended-clicks", limit)
-    
-    if not df_recom.empty:
-        fig = px.bar(df_recom, 
-                     x="total_recom_clicks", 
-                     y="title", 
-                     orientation='h', 
-                     title=f"상위 {limit}개 콘텐츠의 추천 클릭 수", 
-                     labels={"total_recom_clicks": "총 추천 클릭 수", "title": "콘텐츠 제목"},
-                     text='total_recom_clicks')
-        fig.update_layout(yaxis={'categoryorder':'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-        
-        with st.expander("상세 데이터 보기"):
-            st.dataframe(df_recom)
-    else:
-        st.warning("표시할 추천 클릭 데이터가 없습니다.")
-
-# 5. 종합 클릭이 많은 콘텐츠 탭 (기존)
-with tab5:
-    st.header("💥 종합 클릭이 많은 콘텐츠 (기존)")
-    st.markdown("단순 **콘텐츠 클릭(content_click)** 횟수가 가장 많은 콘텐츠입니다.")
-    with st.spinner("데이터 로딩 중..."):
-        df_clicks = fetch_analytics_data("analytics/top-clicks", limit)
-    
-    if not df_clicks.empty:
-        fig = px.bar(df_clicks, 
-                     x="total_clicks", 
-                     y="title", 
-                     orientation='h', 
-                     title=f"상위 {limit}개 콘텐츠의 종합 클릭 수", 
-                     labels={"total_clicks": "총 클릭 수", "title": "콘텐츠 제목"},
-                     text='total_clicks')
-        fig.update_layout(yaxis={'categoryorder':'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-        
-        with st.expander("상세 데이터 보기"):
-            st.dataframe(df_clicks)
-    else:
-        st.warning("표시할 종합 클릭 데이터가 없습니다.")
-
-# 6. 원본 로그 데이터 조회 탭
-with tab6:
     st.header("📜 원본 로그 데이터 조회 (`user_logs`)")
     st.markdown("가공되지 않은 원본 `user_logs` 테이블의 데이터를 직접 조회합니다. 데이터 양이 많을 수 있으므로 필터 사용을 권장합니다.")
 
@@ -224,7 +312,7 @@ with tab6:
 
     if submitted:
         with st.spinner("원본 로그 데이터 로딩 중..."):
-            df_logs = fetch_raw_log_data(limit, where_input)
+            df_logs = fetch_raw_log_data(limit=limit, where_clause=where_input, database="analytics", table="user_logs")
         
         if not df_logs.empty:
             st.success(f"**{len(df_logs)}개**의 로그 데이터를 조회했습니다.")
