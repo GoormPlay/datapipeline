@@ -362,6 +362,7 @@ def main():
 
         # Iceberg 테이블 이름 정의
         raw_data_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.{args.iceberg_table_name}"
+        bronze_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.user_logs_bronze" # 브론즈 테이블 이름 정의
         video_clicks_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.video_clicks_summary"
         user_interest_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.user_content_interest_summary"
         content_play_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.content_play_summary"
@@ -382,12 +383,44 @@ def main():
             .option("failOnDataLoss", "false") \
             .load()
 
-        logger.info(f"Kafka 스트리밍 리더 설정 완료 (토픽: {args.kafka_topic})")
+        logger.info(f"Kafka 스트리밍 리더 설정 완료 (토픽: {args.kafka_topic})")        
+
+        # --- 브론즈 레이어 구현 ---
+        # 0. 브론즈 테이블 생성 (존재하지 않을 경우)
+        bronze_table_ddl = f"""
+        CREATE TABLE IF NOT EXISTS {bronze_table} (
+            `key` BINARY,
+            `value` BINARY,
+            topic STRING,
+            partition INT,
+            offset LONG,
+            `timestamp` TIMESTAMP,
+            timestampType INT,
+            processing_timestamp TIMESTAMP
+        ) USING iceberg PARTITIONED BY (days(processing_timestamp))
+        """
+        logger.info(f"Ensuring bronze table {bronze_table} exists...")
+        spark.sql(bronze_table_ddl)
+        logger.info(f"Bronze table {bronze_table} ensured.")
+
+        # 1. 원본 Kafka 메시지를 브론즈 테이블에 저장
+        bronze_df = df.withColumn("processing_timestamp", func.current_timestamp())
+        bronze_query = bronze_df.writeStream \
+            .format("iceberg") \
+            .outputMode("append") \
+            .option("checkpointLocation", f"{args.checkpoint_location}/bronze_data") \
+            .toTable(bronze_table)
+        active_queries.append(bronze_query)
+        logger.info(f"브론즈 테이블 스트림 시작됨: {bronze_table}")
+
+        # --- 실버 레이어 구현 (브론즈 테이블에서 데이터 읽기) ---
+        # 브론즈 테이블에서 스트림으로 데이터 읽기
+        bronze_stream_df = spark.readStream.table(bronze_table)
 
         # Avro 디코딩 (Confluent 와이어 포맷 처리)
         # Kafka 'value' 컬럼에서 5바이트 헤더(Magic Byte + Schema ID)를 제거합니다.
         # from_avro 함수에 스키마 문자열을 직접 제공할 때는 순수 Avro 바이너리 데이터만 전달해야 합니다.
-        fixed_value_df = df.withColumn("fixedValue", func.expr("substring(value, 6, length(value)-5)"))
+        fixed_value_df = bronze_stream_df.withColumn("fixedValue", func.expr("substring(value, 6, length(value)-5)"))
 
         try:
             fromAvroOptions = {"mode":"PERMISSIVE"}

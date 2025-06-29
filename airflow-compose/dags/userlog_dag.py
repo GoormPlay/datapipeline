@@ -10,6 +10,10 @@ from io import StringIO, BytesIO
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# Parquet 처리를 위한 pyarrow import
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from kafka.structs import OffsetAndMetadata
 from kafka import KafkaConsumer
 from kafka import KafkaAdminClient
@@ -27,6 +31,10 @@ def connect_minio():
     return s3_hook
 
 def kafka_consumer(**context):
+    # XCom PUSH를 위한 기본값 설정
+    context['ti'].xcom_push(key='s3_object_key', value=None)
+    context['ti'].xcom_push(key='base_filename_for_processed', value=None)
+
     try:
         consumer = KafkaConsumer(
             'content-user-events',
@@ -70,23 +78,46 @@ def kafka_consumer(**context):
 
         # DAG 실행시간으로 파일명 지정
         execution_date = context['execution_date'].astimezone(ZoneInfo("Asia/Seoul"))
-        filename = execution_date.strftime("%Y-%m-%d_%H-%M-%S") + ".json"
+        base_filename = execution_date.strftime("%Y-%m-%d_%H-%M-%S")
+        parquet_filename = f"{base_filename}.parquet"
+        s3_object_key = f"bronze/user-logs/{parquet_filename}" # Bronze 레이어를 위한 경로 지정
 
-        with open(filename, "w") as f:
-            for tp, message in messages.items():
-                for msg in message:
-                    try:
-                        event = msg.value
-                        json.dump(event, f)
-                        f.write("\n")
-                        print(f"📥 Received: page:{event.get('page')}")
-                        consumer.commit(offsets={tp: OffsetAndMetadata(msg.offset + 1, None)})
-                    except Exception as e:
-                        print(f"❌ Failed to process message: {e}")
-                        raise e
+        collected_events = []
+        offsets_to_commit = {}
 
-        s3_hook.load_file(filename, filename, bucket_name, replace=True)
-        print(f"File uploaded to MinIO: {filename}")
+        for tp, message_list in messages.items():
+            for msg in message_list:
+                try:
+                    event = msg.value
+                    collected_events.append(event)
+                    # 마지막 오프셋만 기억하면 됨
+                except Exception as e:
+                    print(f"❌ Failed to process message: {e}")
+                    raise e
+            # 파티션별로 마지막 오프셋을 커밋하기 위해 저장
+            last_offset = message_list[-1].offset
+            offsets_to_commit[tp] = OffsetAndMetadata(last_offset + 1, None)
+            print(f"📥 Processed {len(message_list)} messages from partition {tp.partition}. Last offset: {last_offset}")
+
+        if not collected_events:
+            print("ℹ️ No messages collected. Task finished.")
+            return
+
+        # 수집된 이벤트를 Parquet으로 변환하여 MinIO에 업로드
+        arrow_table = pa.Table.from_pylist(collected_events)
+        parquet_buffer = BytesIO()
+        pq.write_table(arrow_table, parquet_buffer)
+        parquet_buffer.seek(0)
+
+        s3_hook.load_file_obj(parquet_buffer, s3_object_key, bucket_name, replace=True)
+        print(f"✅ Parquet file uploaded to MinIO: s3://{bucket_name}/{s3_object_key}")
+
+        # 오프셋 커밋
+        consumer.commit(offsets=offsets_to_commit)
+        print(f"✅ Offsets committed.")
+
+        context['ti'].xcom_push(key='s3_object_key', value=s3_object_key)
+        context['ti'].xcom_push(key='base_filename_for_processed', value=base_filename)
 
     except Exception as e:
         print(f"❌ DAG failed due to : {e}")
