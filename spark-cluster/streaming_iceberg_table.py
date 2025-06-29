@@ -64,13 +64,13 @@ def fetch_avro_schema(schema_registry_url, subject):
 def get_schema_hash(schema_str):
     """스키마 문자열의 해시값 계산"""
     schema_dict = json.loads(schema_str)
-    normalized = json.dumps(schema_dict, sort_keys=True)
-    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+    normalized = json.dumps(schema_dict, sort_keys=True) # key값으로 정렬해서 스키마 정규화
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest() # 바이트 단위를 UTF-8 형식의 바이트로 변환하여 해시값 계산 -> 16진수 문자열로 변환
 
 def get_last_schema_hash_from_s3(s3_client, bucket, key):
     """S3에서 이전에 저장된 스키마 해시 가져오기"""
     try:
-        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        obj = s3_client.get_object(Bucket=bucket, Key=key) # 딕셔너리형태, 파일의 메타데이터와 실제 파일 내용 포함
         return obj['Body'].read().decode('utf-8')
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
@@ -336,9 +336,9 @@ def main():
             logger.info("Avro 스키마 변경 없음")
 
         spark = None
-        active_queries = []
+        active_queries = [] # 스트림 안정적 종료 및 자원관리
 
-        # SparkSession 설정 - iceberge.type 명시 에러
+        # SparkSession 설정 - 로컬 metastore.db 사용 (enableHiveSupport())
         spark = SparkSession.builder \
         .appName("KafkaToIcebergETL") \
         .config("spark.driver.bindAddress", "127.0.0.1") \
@@ -407,10 +407,9 @@ def main():
             send_slack_notification(args.slack_webhook_url, error_message)
             raise
 
-        # 디버깅: 변환된 데이터 구조 확인
+        # 디버깅: 변환된 데이터 구조 확인 : (from_avro 직후, data.* 펼친 상태)를 콘솔에 출력
         debug_decoded_query = None
         if logger.isEnabledFor(logging.DEBUG):
-            # decoded_df (from_avro 직후, data.* 펼친 상태)를 콘솔에 출력
             debug_decoded_query = decoded_df.writeStream \
                 .outputMode("append") \
                 .format("console") \
@@ -470,6 +469,7 @@ def main():
         spark.sql(create_table_sql)
         logger.info(f"Table {raw_data_table} ensured.")
         try:
+            # 정보를 캐시에서 지우고 MinIO에 저장된 최신데이터로 변경
             spark.catalog.refreshTable(raw_data_table)
             logger.info(f"Refreshed catalog for table {raw_data_table}")
         except Exception as e_refresh:
@@ -511,6 +511,8 @@ def main():
         logger.info(f"Ensuring table {user_interest_summary_table} exists...")
         spark.sql(user_interest_ddl)
         logger.info(f"Table {user_interest_summary_table} ensured.")
+        spark.catalog.refreshTable(user_interest_summary_table)
+        logger.info(f"Refreshed catalog for table {user_interest_summary_table}")
 
         # 4. content_play_summary 테이블 생성 (존재하지 않을 경우)
         content_play_ddl = f"""
@@ -527,6 +529,8 @@ def main():
         logger.info(f"Ensuring table {content_play_summary_table} exists...")
         spark.sql(content_play_ddl)
         logger.info(f"Table {content_play_summary_table} ensured.")
+        spark.catalog.refreshTable(content_play_summary_table)
+        logger.info(f"Refreshed catalog for table {content_play_summary_table}")
 
         # 5. recommendation_click_summary 테이블 생성 (존재하지 않을 경우)
         recom_click_ddl = f"""
@@ -543,6 +547,8 @@ def main():
         logger.info(f"Ensuring table {recom_click_summary_table} exists...")
         spark.sql(recom_click_ddl)
         logger.info(f"Table {recom_click_summary_table} ensured.")
+        spark.catalog.refreshTable(recom_click_summary_table)
+        logger.info(f"Refreshed catalog for table {recom_click_summary_table}")
 
 
         # 1. 원본 데이터를 Iceberg user_logs 테이블에 저장 (느슨한 결합)
@@ -673,7 +679,8 @@ def main():
 
         # 4. 콘텐츠 재생 시작 집계 (재생 시간 대신 재생 시작 횟수 집계)
         # 참고: 정확한 재생 시간 계산은 `mapGroupsWithState`와 같은 고급 상태 저장 스트리밍 연산이 필요하여 복잡합니다.
-        #       재생 시작 횟수는 사용자 참여도를 측정하는 강력하고 간단한 대안입니다.
+        
+        # 초기화함으로써 요류발생으로 try 구문이 실행되지 않더라도 play_summary_query 변수를 참조하는 부분이 오류가 나지 않음
         play_summary_query = None
         try:
             if "event_timestamp" in df_with_event_timestamp.columns:
@@ -743,30 +750,10 @@ def main():
         logger.error(error_message, exc_info=True)
         if 'args' in locals() and hasattr(args, 'slack_webhook_url'):
             send_slack_notification(args.slack_webhook_url, error_message)
-        
-        # 활성화된 스트림 쿼리 종료
-        if 'active_queries' in locals() and active_queries:
-            for query in active_queries:
-                try:
-                    if query and query.isActive:
-                        query.stop()
-                        logger.info("스트림 쿼리가 정상적으로 종료되었습니다.")
-                except Exception as stop_error:
-                    logger.error(f"쿼리 종료 중 오류: {stop_error}")
-        
-        # SparkSession 종료 - 인스턴스 체크 후 종료
-        if spark is not None and not spark._jsc.sc().isStopped():
-            try:
-                spark.stop()
-                logger.info("SparkSession이 정상적으로 종료되었습니다.")
-            except Exception as stop_error:
-                logger.error(f"SparkSession 종료 중 오류: {stop_error}")
-        
-        # 명시적으로 현재 예외 다시 발생
         sys.exit(1)  # 프로그램 종료 with error code
         
     finally:
-        # 정상 종료 시에도 SparkSession과 쿼리 정리
+        # 정상 종료 또는 예외 발생 시 항상 SparkSession과 쿼리 정리
         # 활성화된 스트림 쿼리 종료
         if 'active_queries' in locals() and active_queries:
             for query in active_queries:
