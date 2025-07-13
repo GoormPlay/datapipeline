@@ -1,4 +1,4 @@
-# 📡 Kafka → Spark Structured Streaming → Iceberg 실시간 ETL 파이프라인
+# 📡 Kafka → Spark Structured Streaming → Iceberg 스트리밍 ETL 파이프라인
 
 이 프로젝트는 Kafka로 수집된 실시간 사용자 로그 데이터를 Spark Structured Streaming을 통해 처리하고, Apache Iceberg 테이블에 적재하는 **실시간 ETL 파이프라인**입니다.
 추가적으로, API 서버와 Streamlit 대시보드를 통해 집계 결과 및 원장 데이터를 실시간으로 조회할 수 있도록 구성했습니다.
