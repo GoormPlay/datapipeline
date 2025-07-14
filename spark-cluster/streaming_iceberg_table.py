@@ -362,7 +362,7 @@ def main():
 
         # Iceberg 테이블 이름 정의
         raw_data_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.{args.iceberg_table_name}"
-        bronze_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.user_logs_bronze" # 브론즈 테이블 이름 정의
+        bronze_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.bronze_raw_data" # 브론즈 테이블 이름 정의
         video_clicks_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.video_clicks_summary"
         user_interest_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.user_content_interest_summary"
         content_play_summary_table = f"{args.iceberg_catalog_name}.{args.iceberg_db_name}.content_play_summary"
