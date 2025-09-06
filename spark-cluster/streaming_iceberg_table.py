@@ -272,7 +272,7 @@ def main():
         parser.add_argument("--s3_secret_key", required=True, help='S3 시크릿 키')
         parser.add_argument("--s3_region", required=True, help='S3 리전')
         # monitoring
-        parser.add_argument("--processing_time_trigger", default="30 seconds", help='처리 시간 트리거 (예: "30 seconds")')
+        parser.add_argument("--processing_time_trigger", default="60 seconds", help='처리 시간 트리거 (예: "60 seconds")')
         parser.add_argument("--schema_version_s3_bucket", required=True, help='스키마 버전 저장할 S3 버킷')
         parser.add_argument("--schema_version_s3_key", required=True, help='스키마 버전 저장할 S3 키')
         parser.add_argument("--slack_webhook_url", default=None, help='Slack 웹훅 URL')
@@ -627,9 +627,9 @@ def main():
                 df_for_aggregation = df_with_event_timestamp.select("videoId", "title", "eventType", "event_timestamp")
                 video_click_counts_df = df_for_aggregation \
                 .filter(col("eventType") == "content_click") \
-                .withWatermark("event_timestamp", "5 minutes") \
+                .withWatermark("event_timestamp", "10 minutes") \
                 .groupBy(
-                    window(col("event_timestamp"), args.processing_time_trigger).alias("time_window"),
+                    window((col("event_timestamp"), args.processing_time_trigger).alias("time_window"), "5 minutes"),
                     col("videoId"),
                     col("title")
                 ) \
@@ -682,9 +682,9 @@ def main():
                 )
 
                 user_interest_summary_df = interest_score_df \
-                    .withWatermark("event_timestamp", "5 minutes") \
+                    .withWatermark("event_timestamp", "10 minutes") \
                     .groupBy(
-                        window(col("event_timestamp"), "30 minutes").alias("time_window"),
+                        window((col("event_timestamp"), "30 minutes").alias("time_window"), "5 minutes"),
                         col("userId"),
                         col("videoId"),
                         col("title")
@@ -721,9 +721,9 @@ def main():
                 play_start_df = df_with_event_timestamp.filter(col("eventType") == "play_start")
 
                 content_play_summary_df = play_start_df \
-                    .withWatermark("event_timestamp", "5 minutes") \
+                    .withWatermark("event_timestamp", "10 minutes") \
                     .groupBy(
-                        window(col("event_timestamp"), "30 minutes").alias("time_window"),
+                        window((col("event_timestamp"), "30 minutes").alias("time_window"), "5 minutes"),
                         col("videoId"),
                         col("title")
                     ) \
@@ -755,8 +755,8 @@ def main():
                 recom_click_df = df_with_event_timestamp.filter(col("eventType") == "content_recom_click")
 
                 recommendation_click_summary_df = recom_click_df \
-                    .withWatermark("event_timestamp", "5 minutes") \
-                    .groupBy(window(col("event_timestamp"), "30 minutes").alias("time_window"), col("videoId"), col("title")) \
+                    .withWatermark("event_timestamp", "10 minutes") \
+                    .groupBy((window(col("event_timestamp"), "30 minutes").alias("time_window"), "5 minutes"), col("videoId"), col("title")) \
                     .agg(func.count("*").alias("recom_click_count")) \
                     .select(col("time_window.start").alias("window_start"), col("time_window.end").alias("window_end"), col("videoId"), col("title"), col("recom_click_count"))
 
